@@ -1,0 +1,111 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #0b1220;
+  --surface: #141b2e;
+  --surface-raised: #1a2338;
+  --border: #232b42;
+  --text-primary: #edeff5;
+  --text-muted: #8b93ac;
+  --amber: #e8a33d;
+  --amber-dim: #e8a33d33;
+  --teal: #3fc6b4;
+  --teal-dim: #3fc6b433;
+  --danger: #e2604f;
+  --danger-dim: #e2604f26;
+
+  --font-display: Georgia, "Times New Roman", serif;
+  --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: "Consolas", "SFMono-Regular", Menlo, monospace;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-border: var(--border);
+  --color-text-primary: var(--text-primary);
+  --color-text-muted: var(--text-muted);
+  --color-amber: var(--amber);
+  --color-teal: var(--teal);
+  --color-danger: var(--danger);
+  --font-display: var(--font-display);
+  --font-body: var(--font-body);
+  --font-mono: var(--font-mono);
+}
+
+body {
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+}
+
+/* Ticket-stub divider: a row of small punched circles between the date
+   stub and the price stub of each night card - the page's one signature
+   motif, borrowed from travel/boarding-pass vernacular. */
+.stub-divider {
+  position: relative;
+  width: 1px;
+  background-image: radial-gradient(circle, var(--bg) 2.5px, transparent 2.6px);
+  background-size: 1px 14px;
+  background-repeat: repeat-y;
+}
+.stub-divider::before,
+.stub-divider::after {
+  content: "";
+  position: absolute;
+  left: -7px;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: var(--bg);
+}
+.stub-divider::before { top: -7px; }
+.stub-divider::after { bottom: -7px; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .fade-in {
+    animation: fadeIn 220ms ease-out;
+  }
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ------------------------------------------------------------------ */
+/* Listing page (marketing) theme - light, photo-forward, scoped to    */
+/* .listing-page so it never leaks into the dark host-dashboard theme. */
+/* ------------------------------------------------------------------ */
+.listing-page {
+  --lp-bg: #fffcf7;
+  --lp-surface: #ffffff;
+  --lp-border: #ece6da;
+  --lp-text: #22201b;
+  --lp-text-muted: #6b675e;
+  --lp-teal: #21867a;
+  --lp-teal-dim: #21867a1a;
+  --lp-terracotta: #c9714a;
+  --lp-terracotta-dim: #c9714a1a;
+
+  background: var(--lp-bg);
+  color: var(--lp-text);
+  font-family: var(--font-body);
+  min-height: 100vh;
+}
+
+.listing-page .photo-tile {
+  background-size: cover;
+  background-position: center;
+  position: relative;
+}
+.listing-page .photo-tile span {
+  position: absolute;
+  bottom: 10px;
+  left: 12px;
+  font-size: 11px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.92);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+}
