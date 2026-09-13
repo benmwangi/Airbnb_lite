@@ -11,15 +11,36 @@ manager or partner API needed. See README.md for what changes if you ever
 point this at a real, live Airbnb listing instead.
 """
 import datetime
+import os
+import time
 from typing import Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from sqlalchemy import func, select
 
-from db import init_db, get_session, Listing, CalendarDay, Market, MarketComparison, ReviewInsight
+from db import init_db, get_session, Listing, CalendarDay, Market, MarketComparison, ReviewInsight, ReviewExcerpt, User
+import auth
 from pricing_engine import run_pricing_cycle, price_listing_for_date, price_single_listing
+from pricing_model import train_all_markets, predict_base_price, load_market_model, MODEL_DIR
 
 app = FastAPI(title="Airbnb-lite Dynamic Pricing API")
+MAX_HOST_CALENDAR_DAYS = 365
+_markets_cache: tuple[float, list[dict]] | None = None
+# Shared secret the scheduled maintenance cron authenticates with (see
+# claude/deployment-scheduling-guide.md) - unset locally, where this endpoint
+# simply isn't callable rather than silently open.
+CRON_SECRET = os.environ.get("CRON_SECRET")
+
+
+def _unique_image_listing_ids(session, market_id: Optional[int] = None):
+    query = select(func.min(Listing.id)).where(
+        Listing.picture_url.isnot(None),
+        Listing.picture_url != "",
+    )
+    if market_id:
+        query = query.where(Listing.market_id == market_id)
+    return query.group_by(Listing.picture_url)
 
 # Allows the Next.js dev server (a different origin: localhost:3000 vs this
 # API's localhost:8000) to actually read responses from this API. Without
@@ -41,29 +62,136 @@ app.add_middleware(
 @app.on_event("startup")
 def startup():
     init_db()
+    # Render's free web service tier wipes the local filesystem on every
+    # spin-down (see claude/deployment-scheduling-guide.md), which deletes
+    # these joblib files along with everything else on disk - without this,
+    # the first request after a cold start that needs a price prediction
+    # would 500 with "No trained model for market X." Only retrains when a
+    # model is actually missing, so local dev (where models/ already exists
+    # on disk from a previous run) isn't slowed down by retraining on every
+    # --reload restart.
+    session = get_session()
+    market_ids = [m.id for m in session.query(Market).all()]
+    session.close()
+    missing = [
+        mid for mid in market_ids
+        if not os.path.exists(os.path.join(MODEL_DIR, f"market_{mid}.joblib"))
+    ]
+    if missing:
+        train_all_markets()
+
+
+class SignupRequest(BaseModel):
+    email: str
+    password: str
+    name: str
+    role: str  # "guest" or "host"
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+def _user_out(user: User) -> dict:
+    return {"id": user.id, "email": user.email, "name": user.name, "role": user.role, "host_id": user.host_id}
+
+
+@app.post("/auth/signup")
+def signup(req: SignupRequest):
+    if req.role not in ("guest", "host"):
+        raise HTTPException(400, "role must be 'guest' or 'host'")
+    if len(req.password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+
+    session = get_session()
+    if session.query(User).filter_by(email=req.email).first():
+        session.close()
+        raise HTTPException(409, "An account with this email already exists")
+
+    password_hash, salt = auth.hash_password(req.password)
+    # A fresh host account starts with no real listings (host_id is a new,
+    # unused number) - that's expected, not a bug. The seeded demo host
+    # account (see seed_demo_accounts.py) is the one pre-linked to a real,
+    # populated host_id for immediate demoing.
+    new_host_id = None
+    if req.role == "host":
+        max_existing = session.query(Listing.host_id).order_by(Listing.host_id.desc()).first()
+        new_host_id = (max_existing[0] + 1) if max_existing else 1
+
+    user = User(email=req.email, password_hash=password_hash, password_salt=salt,
+                name=req.name, role=req.role, host_id=new_host_id)
+    session.add(user)
+    session.commit()
+    token = auth.create_session(session, user)
+    result = {"token": token, "user": _user_out(user)}
+    session.close()
+    return result
+
+
+@app.post("/auth/login")
+def login(req: LoginRequest):
+    session = get_session()
+    user = session.query(User).filter_by(email=req.email).first()
+    if not user or not auth.verify_password(req.password, user.password_hash, user.password_salt):
+        session.close()
+        raise HTTPException(401, "Incorrect email or password")
+    token = auth.create_session(session, user)
+    result = {"token": token, "user": _user_out(user)}
+    session.close()
+    return result
+
+
+@app.get("/auth/me")
+def me(authorization: Optional[str] = Header(None)):
+    user = auth.get_user_from_token(auth.extract_bearer_token(authorization))
+    if not user:
+        raise HTTPException(401, "Not logged in")
+    return _user_out(user)
 
 
 @app.get("/markets")
 def list_markets():
+    global _markets_cache
+    if _markets_cache and _markets_cache[0] > time.monotonic():
+        return _markets_cache[1]
     session = get_session()
     markets = session.query(Market).all()
     out = [{"id": m.id, "name": m.name, "country": m.country, "currency": m.currency,
-            "listing_count": len(m.listings)} for m in markets]
+            "listing_count": m.listing_count} for m in markets]
     session.close()
+    _markets_cache = (time.monotonic() + 60, out)
     return out
 
 
 @app.get("/host/my-listings")
-def my_listings(host_id: int = 175128252):
-    """Returns every listing owned by a given host_id, across all markets - the
-    'my listings' portfolio view. Defaults to a real host_id from the Maven
-    dataset (175128252) who genuinely owns 3 listings spanning 2 real markets
-    (Cape Town and Sydney) - a real, not fabricated, multi-listing/multi-market
-    host, used here as the demo logged-in host."""
+def my_listings(authorization: Optional[str] = Header(None)):
+    """Returns every listing owned by the LOGGED-IN host's host_id, across all
+    markets - the 'my listings' portfolio view. Requires a host session;
+    host_id is taken from the authenticated user, not a hardcoded default,
+    so this genuinely reflects whoever is logged in rather than always
+    showing the same demo host regardless of who's signed in."""
+    user = auth.get_user_from_token(auth.extract_bearer_token(authorization))
+    if not user or user.role != "host":
+        raise HTTPException(401, "Host login required")
+
     session = get_session()
-    listings = session.query(Listing).filter_by(host_id=host_id).all()
+    # Excludes listings with no picture_url in the archive, matching what
+    # guest search already does (_unique_image_listing_ids, above) - a host
+    # shouldn't see pricing controls for a listing that's invisible to guests
+    # anyway. Deliberately NOT the same query as guest search though: this
+    # only checks picture_url is present, it doesn't dedupe by distinct URL
+    # like guest search does - a host's own listings that happen to share a
+    # photo are still real, separate listings and should all show up here.
+    listings = session.query(Listing).filter(
+        Listing.host_id == user.host_id,
+        Listing.picture_url.isnot(None),
+        Listing.picture_url != "",
+    ).all()
     out = [{
         "id": l.id, "host_id": l.host_id, "market": l.market.name, "market_id": l.market_id, "currency": l.market.currency,
+        "name": l.name, "picture_url": l.picture_url, "property_type": l.property_type,
+        "neighbourhood": l.neighbourhood,
         "room_type": l.room_type, "accommodates": l.accommodates, "host_is_superhost": l.host_is_superhost,
         "review_scores_rating": l.review_scores_rating, "min_floor": l.min_floor, "max_ceiling": l.max_ceiling,
         "auto_apply": l.auto_apply,
@@ -72,17 +200,70 @@ def my_listings(host_id: int = 175128252):
     return out
 
 
+def _require_listing_owner(session, listing_id: int, authorization: Optional[str]) -> Listing:
+    """Confirms the request carries a valid host session AND that host
+    actually owns this listing, before allowing a pricing mutation. Without
+    this, any client could set or approve prices on a listing that isn't
+    theirs just by knowing its numeric id."""
+    user = auth.get_user_from_token(auth.extract_bearer_token(authorization))
+    if not user or user.role != "host":
+        raise HTTPException(401, "Host login required")
+    listing = session.query(Listing).get(listing_id)
+    if not listing:
+        raise HTTPException(404, "Listing not found")
+    if listing.host_id != user.host_id:
+        raise HTTPException(403, "You don't own this listing")
+    return listing
+
+
 @app.post("/listings/{listing_id}/price-year")
-def price_year(listing_id: int, days_ahead: int = 365):
+def price_year(listing_id: int, days_ahead: int = MAX_HOST_CALENDAR_DAYS, authorization: Optional[str] = Header(None)):
     """Prices a single listing across a long horizon (a full year by default) -
     used by the host year-calendar view. Runs synchronously; ~3s for 365
     nights for one listing (verified), since base-price inference happens once
     per call rather than once per night."""
+    if not 1 <= days_ahead <= MAX_HOST_CALENDAR_DAYS:
+        raise HTTPException(400, f"days_ahead must be between 1 and {MAX_HOST_CALENDAR_DAYS}")
+    session = get_session()
+    _require_listing_owner(session, listing_id, authorization)
+    session.close()
     try:
         price_single_listing(listing_id, days_ahead=days_ahead)
     except ValueError:
         raise HTTPException(404, "Listing not found")
     return {"status": "ok", "listing_id": listing_id, "days_ahead": days_ahead}
+
+
+@app.get("/listings/card-prices")
+def listing_card_prices(listing_ids: str, days: int = 7):
+    """Returns guest-safe average prices for several listing cards at once."""
+    if not 1 <= days <= 14:
+        raise HTTPException(400, "days must be between 1 and 14")
+    try:
+        ids = [int(value) for value in listing_ids.split(",") if value.strip()]
+    except ValueError:
+        raise HTTPException(400, "listing_ids must be a comma-separated list of integers")
+    if not ids or len(ids) > 100:
+        raise HTTPException(400, "listing_ids must contain between 1 and 100 IDs")
+
+    session = get_session()
+    today = datetime.date.today()
+    rows = session.query(CalendarDay, Listing.min_floor).join(
+        Listing, Listing.id == CalendarDay.listing_id
+    ).filter(
+        CalendarDay.listing_id.in_(ids),
+        CalendarDay.date >= today,
+        CalendarDay.date < today + datetime.timedelta(days=days),
+    ).all()
+    prices: dict[int, list[float]] = {listing_id: [] for listing_id in ids}
+    for row, floor in rows:
+        prices[row.listing_id].append(row.live_price if row.live_price is not None else floor)
+    session.close()
+    return {
+        str(listing_id): sum(values) / len(values)
+        for listing_id, values in prices.items()
+        if values
+    }
 
 
 @app.get("/listings/{listing_id}")
@@ -93,7 +274,12 @@ def get_listing(listing_id: int):
         session.close()
         raise HTTPException(404, "Listing not found")
     out = {
-        "id": l.id, "host_id": l.host_id, "market": l.market.name, "currency": l.market.currency,
+        "id": l.id, "host_id": l.host_id, "host_name": l.host_name, "market": l.market.name, "currency": l.market.currency,
+        "name": l.name, "description": l.description, "host_location": l.host_location,
+        "neighbourhood": l.neighbourhood, "property_type": l.property_type,
+        "amenities": l.amenities, "house_rules": l.house_rules, "picture_url": l.picture_url,
+        "minimum_nights": l.minimum_nights, "maximum_nights": l.maximum_nights,
+        "instant_bookable": l.instant_bookable,
         "room_type": l.room_type, "accommodates": l.accommodates, "bedrooms": l.bedrooms,
         "bathrooms": l.bathrooms, "dist_to_center_km": l.dist_to_center_km,
         "host_is_superhost": l.host_is_superhost, "review_scores_rating": l.review_scores_rating,
@@ -105,24 +291,71 @@ def get_listing(listing_id: int):
 
 
 @app.get("/listings")
-def list_listings(market_id: Optional[int] = None):
+def list_listings(market_id: Optional[int] = None, limit: int = 24, offset: int = 0):
+    if not 1 <= limit <= 100:
+        raise HTTPException(400, "limit must be between 1 and 100")
+    if offset < 0:
+        raise HTTPException(400, "offset must be non-negative")
     session = get_session()
-    q = session.query(Listing)
+    q = session.query(Listing).filter(Listing.id.in_(_unique_image_listing_ids(session, market_id)))
     if market_id:
         q = q.filter(Listing.market_id == market_id)
-    listings = q.all()
+    listings = q.order_by(Listing.id).offset(offset).limit(limit).all()
     out = [{
-        "id": l.id, "host_id": l.host_id, "market": l.market.name, "currency": l.market.currency,
-        "room_type": l.room_type, "accommodates": l.accommodates,
+        "id": l.id, "host_id": l.host_id, "host_name": l.host_name, "market": l.market.name, "currency": l.market.currency,
+        "name": l.name, "property_type": l.property_type, "neighbourhood": l.neighbourhood,
+        "picture_url": l.picture_url, "room_type": l.room_type, "accommodates": l.accommodates,
         "host_is_superhost": l.host_is_superhost, "review_scores_rating": l.review_scores_rating,
-        "min_floor": l.min_floor, "max_ceiling": l.max_ceiling, "auto_apply": l.auto_apply,
+        "num_reviews": l.num_reviews, "min_floor": l.min_floor, "max_ceiling": l.max_ceiling, "auto_apply": l.auto_apply,
     } for l in listings]
     session.close()
     return out
 
 
+@app.get("/search-cards")
+def search_cards(market_id: int, guests: int = 1, limit: int = 12, offset: int = 0):
+    """Returns filtered guest cards and their safe display prices in one read."""
+    if guests < 1 or not 1 <= limit <= 100 or offset < 0:
+        raise HTTPException(400, "invalid guest, limit, or offset")
+    session = get_session()
+    listings = session.query(Listing).filter(
+        Listing.id.in_(_unique_image_listing_ids(session, market_id)),
+        Listing.market_id == market_id,
+        Listing.accommodates >= guests,
+    ).order_by(Listing.id).offset(offset).limit(limit).all()
+    ids = [listing.id for listing in listings]
+    today = datetime.date.today()
+    rows = session.query(CalendarDay, Listing.min_floor).join(
+        Listing, Listing.id == CalendarDay.listing_id
+    ).filter(
+        CalendarDay.listing_id.in_(ids or [-1]),
+        CalendarDay.date >= today,
+        CalendarDay.date < today + datetime.timedelta(days=7),
+    ).all()
+    prices: dict[int, list[float]] = {listing_id: [] for listing_id in ids}
+    for row, floor in rows:
+        prices[row.listing_id].append(row.live_price if row.live_price is not None else floor)
+    out = [{
+        "id": listing.id, "host_id": listing.host_id, "host_name": listing.host_name,
+        "market": listing.market.name, "currency": listing.market.currency,
+        "name": listing.name, "property_type": listing.property_type,
+        "neighbourhood": listing.neighbourhood, "picture_url": listing.picture_url,
+        "room_type": listing.room_type, "accommodates": listing.accommodates,
+        "host_is_superhost": listing.host_is_superhost,
+        "review_scores_rating": listing.review_scores_rating, "num_reviews": listing.num_reviews,
+        "min_floor": listing.min_floor, "max_ceiling": listing.max_ceiling,
+        "auto_apply": listing.auto_apply,
+        "nightly_price": sum(prices[listing.id]) / len(prices[listing.id])
+        if prices[listing.id] else None,
+    } for listing in listings]
+    session.close()
+    return out
+
+
 @app.get("/listings/{listing_id}/calendar")
-def listing_calendar(listing_id: int, days: int = 14):
+def listing_calendar(listing_id: int, days: int = MAX_HOST_CALENDAR_DAYS):
+    if not 1 <= days <= MAX_HOST_CALENDAR_DAYS:
+        raise HTTPException(400, f"days must be between 1 and {MAX_HOST_CALENDAR_DAYS}")
     session = get_session()
     listing = session.query(Listing).get(listing_id)
     if not listing:
@@ -148,9 +381,52 @@ def listing_calendar(listing_id: int, days: int = 14):
 
 
 @app.post("/pricing/run")
-def trigger_pricing_run(days_ahead: int = 14):
+def trigger_pricing_run(days_ahead: int = 365):
     run_pricing_cycle(days_ahead=days_ahead)
     return {"status": "ok", "days_ahead": days_ahead}
+
+
+@app.post("/admin/retrain-and-fix-guardrails")
+def retrain_and_fix_guardrails(authorization: Optional[str] = Header(None)):
+    """Retrains each market's pricing model on current listing data, then
+    recomputes every listing's floor/ceiling guardrail from the freshly
+    retrained model's own predicted base price (same 0.65x/1.8x rule as
+    fix_guardrails.py), then reprices the near-term calendar so guests see
+    the new guardrails right away instead of waiting on the next nightly
+    /pricing/run to happen to fire after this one.
+
+    Deliberately NOT on the nightly schedule: nothing about the model
+    changes between calls unless it's retrained, so running this nightly
+    would just recompute identical guardrails for no benefit. Meant to be
+    triggered monthly (or on demand) - see claude/deployment-scheduling-guide.md.
+
+    Guarded by CRON_SECRET rather than left open like /pricing/run, since
+    retraining is materially more expensive (refits a RandomForest per
+    market) and rewrites model files on disk."""
+    if not CRON_SECRET or authorization != f"Bearer {CRON_SECRET}":
+        raise HTTPException(401, "Not authorized")
+
+    train_all_markets()
+    # load_market_model() is cached per worker process (see pricing_model.py's
+    # @lru_cache) - without clearing it here, predict_base_price below would
+    # keep returning predictions from the model loaded before this retrain,
+    # silently defeating the point of retraining first.
+    load_market_model.cache_clear()
+
+    session = get_session()
+    fixed = 0
+    for market in session.query(Market).all():
+        listings = session.query(Listing).filter_by(market_id=market.id).all()
+        for listing in listings:
+            base = predict_base_price(listing)
+            listing.min_floor = round(base * 0.65, 2)
+            listing.max_ceiling = round(base * 1.8, 2)
+            fixed += 1
+        session.commit()
+    session.close()
+
+    run_pricing_cycle(days_ahead=14)
+    return {"status": "ok", "listings_fixed": fixed}
 
 
 class ApprovalRequest(BaseModel):
@@ -158,6 +434,43 @@ class ApprovalRequest(BaseModel):
     date: datetime.date
     approve: bool
     override_price: Optional[float] = None
+
+
+@app.get("/listings/{listing_id}/reviews")
+def listing_reviews(listing_id: int, limit: int = 3):
+    """Real guest-facing review excerpts (db.ReviewExcerpt) for the listing
+    detail page - distinct from /review-insights below, which is the
+    host-facing theme summary derived from the same underlying review text.
+    This endpoint was missing entirely (the frontend has always called it,
+    per lib/api.ts's `reviews()`, but there was no matching route here), so
+    every listing page's fetch 404'd, was caught, and silently rendered
+    "Real review excerpts are not available for this listing yet." even for
+    listings with real stored excerpts. Returns available=False (not a 404)
+    when a listing genuinely has zero stored excerpts - not every listing's
+    reviews are present in the local Inside Airbnb snapshot, which is an
+    expected data gap, not an error."""
+    if not 1 <= limit <= 20:
+        raise HTTPException(400, "limit must be between 1 and 20")
+    session = get_session()
+    listing = session.query(Listing).get(listing_id)
+    if not listing:
+        session.close()
+        raise HTTPException(404, "Listing not found")
+
+    rows = session.query(ReviewExcerpt).filter_by(listing_id=listing_id).order_by(
+        ReviewExcerpt.review_date.desc()
+    ).limit(limit).all()
+    out = {
+        "available": len(rows) > 0,
+        "reviews": [{
+            "reviewer_name": r.reviewer_name or "Guest",
+            "date": r.review_date.isoformat() if r.review_date else None,
+            "comments": r.comments,
+            "source": r.source,
+        } for r in rows],
+    }
+    session.close()
+    return out
 
 
 @app.get("/listings/{listing_id}/review-insights")
@@ -196,6 +509,7 @@ def review_insights(listing_id: int):
         "insights": [{
             "theme": i.theme, "mention_count": i.mention_count,
             "total_reviews_scanned": i.total_reviews_scanned, "recommendation": i.recommendation,
+            "specific_details": i.specific_details, "sample_review": i.sample_review,
         } for i in insights],
     }
     session.close()
@@ -235,9 +549,14 @@ def market_comparison(listing_id: int):
 
 
 @app.post("/pricing/approve")
-def approve_price(req: ApprovalRequest):
-    """Host control layer: approve, reject, or override a single night's recommended price."""
+def approve_price(req: ApprovalRequest, authorization: Optional[str] = Header(None)):
+    """Host control layer: approve, reject, or override a single night's recommended
+    price. Requires a host session that actually owns this listing - now that
+    guest bookings resolve their own price independently (see /bookings), this
+    endpoint is exclusively a host action and is locked down accordingly."""
     session = get_session()
+    _require_listing_owner(session, req.listing_id, authorization)
+
     row = session.query(CalendarDay).filter_by(listing_id=req.listing_id, date=req.date).first()
     if not row:
         session.close()
@@ -263,18 +582,49 @@ class BookingRequest(BaseModel):
 
 
 @app.post("/bookings")
-def create_booking(req: BookingRequest):
-    """Simulates a guest booking a night at the current live price - this is what
-    generates real feedback-loop data for retraining/backtesting."""
+def create_booking(req: BookingRequest, authorization: Optional[str] = Header(None)):
+    """Books a night at its resolved guest-facing price: the host's approved
+    or set price if one exists, otherwise the host's own floor price - same
+    approved/set/floor rule the rest of the guest UI uses (never an
+    unconfirmed recommendation). This does NOT require the night to already
+    be host-approved: a booking is a guest action, not a host pricing
+    decision, so it must not silently mutate live_price/status as a side
+    effect of someone booking. Booking without being logged in is still
+    allowed (keeps the demo frictionless), but if a valid guest session is
+    provided, the booking is tied to that guest so it shows up in their trips."""
+    user = auth.get_user_from_token(auth.extract_bearer_token(authorization))
+
     session = get_session()
     row = session.query(CalendarDay).filter_by(listing_id=req.listing_id, date=req.date).first()
-    if not row or row.live_price is None:
+    if not row:
         session.close()
-        raise HTTPException(400, "No live price set for this listing/date yet")
+        raise HTTPException(404, "No pricing found for this listing/date - has it been priced yet?")
 
+    resolved_price = row.live_price if row.live_price is not None else row.listing.min_floor
     row.is_booked = True
-    row.booked_price = row.live_price
+    row.booked_price = resolved_price
+    if user and user.role == "guest":
+        row.guest_user_id = user.id
     session.commit()
     result = {"listing_id": req.listing_id, "date": req.date.isoformat(), "booked_price": row.booked_price}
     session.close()
     return result
+
+
+@app.get("/guest/my-trips")
+def my_trips(authorization: Optional[str] = Header(None)):
+    """Every booking made by the logged-in guest - the real, visible payoff of
+    guest login: without it, a booking is anonymous and can't be looked back
+    up anywhere in the product."""
+    user = auth.get_user_from_token(auth.extract_bearer_token(authorization))
+    if not user or user.role != "guest":
+        raise HTTPException(401, "Guest login required")
+
+    session = get_session()
+    bookings = session.query(CalendarDay).filter_by(guest_user_id=user.id, is_booked=True).order_by(CalendarDay.date).all()
+    out = [{
+        "listing_id": b.listing_id, "market": b.listing.market.name, "currency": b.listing.market.currency,
+        "room_type": b.listing.room_type, "date": b.date.isoformat(), "booked_price": b.booked_price,
+    } for b in bookings]
+    session.close()
+    return out

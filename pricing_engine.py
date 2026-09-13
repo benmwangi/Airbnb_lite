@@ -10,13 +10,24 @@ Pricing decision engine. Combines:
 Weights below are illustrative starting points, not backtested. Before trusting
 them on real bookings, validate them against historical revenue outcomes -
 see the README "Next steps" section.
+
+PERFORMANCE NOTE: run_pricing_cycle batches its database reads per-market
+instead of per (listing, date) pair. For N listings priced over D days, the
+original code issued O(N*D) queries - a signals lookup, a "yesterday's price"
+lookup, and an existence check, all inside price_listing_for_date, once per
+listing-night. This version issues O(D) signal lookups plus a handful of
+bulk CalendarDay/previous-price queries per market, then walks listings and
+dates entirely in memory. price_listing_for_date() still supports being
+called standalone (as price_single_listing() does) by falling back to its
+original per-call lookups when the batched inputs aren't supplied, so
+behavior for that caller is unchanged.
 """
 import datetime
 import numpy as np
 import pandas as pd
 from db import get_session, Listing, CalendarDay, Market, ExternalSignalCache
 from pricing_model import predict_base_price, load_market_model, BASE_NUMERIC_COLUMNS
-from external_signals import fetch_event_signal, fetch_news_signal
+from external_signals import fetch_event_signal, fetch_news_signal, PREDICTHQ_API_KEY, NEWSAPI_KEY
 
 WEIGHTS = {"event": 0.30, "news": 0.15, "seasonality": 0.20}
 MAX_NIGHT_OVER_NIGHT_CHANGE_PCT = 0.15   # guardrail: no more than +/-15% vs previous night's price
@@ -28,21 +39,82 @@ def seasonality_modifier(date: datetime.date) -> float:
     return weekend_lift + summer_lift
 
 
-def get_or_fetch_signals(session, market: Market, date: datetime.date):
-    cached = session.query(ExternalSignalCache).filter_by(market_id=market.id, date=date).first()
-    if cached:
-        return cached
+def _cache_is_stale(cached: ExternalSignalCache) -> bool:
+    """A row cached before PREDICTHQ_API_KEY/NEWSAPI_KEY were configured
+    would otherwise be reused forever - `source` records exactly what
+    fetch_event_signal/fetch_news_signal used at fetch time (see
+    _create_signal_cache_row: "{event_source}+{news_source}"), so comparing
+    it against whichever keys are CURRENTLY set tells us whether a key was
+    added since this row was cached and it needs a real fetch now."""
+    event_source, _, news_source = cached.source.partition("+")
+    event_stale = bool(PREDICTHQ_API_KEY) and event_source != "predicthq"
+    news_stale = bool(NEWSAPI_KEY) and news_source != "newsapi"
+    return event_stale or news_stale
 
+
+def get_or_fetch_signals(session, market: Market, date: datetime.date):
+    """Single-date lookup, kept for callers (like price_single_listing) that
+    only ever need one date at a time. run_pricing_cycle uses
+    get_or_fetch_signals_batch instead to avoid one query per date per
+    listing."""
+    cached = session.query(ExternalSignalCache).filter_by(market_id=market.id, date=date).first()
+    if cached and not _cache_is_stale(cached):
+        return cached
+    return _create_signal_cache_row(session, market, date, existing=cached)
+
+
+def get_or_fetch_signals_batch(session, market: Market, dates: list):
+    """Returns {date: ExternalSignalCache} for every date in `dates`, issuing
+    ONE query for all already-cached rows instead of one query per date.
+    Only dates missing from the cache, or whose cached row is stale (see
+    _cache_is_stale), trigger a fetch_event_signal / fetch_news_signal call,
+    and those rows are flushed once at the end rather than one flush per
+    row."""
+    existing = {
+        row.date: row
+        for row in session.query(ExternalSignalCache).filter(
+            ExternalSignalCache.market_id == market.id,
+            ExternalSignalCache.date.in_(dates),
+        ).all()
+    }
+    result = {}
+    created_any = False
+    for date in dates:
+        cached = existing.get(date)
+        if cached is not None and not _cache_is_stale(cached):
+            result[date] = cached
+        else:
+            result[date] = _create_signal_cache_row(session, market, date, flush=False, existing=cached)
+            created_any = True
+    if created_any:
+        session.flush()
+    return result
+
+
+def _create_signal_cache_row(session, market: Market, date: datetime.date, flush: bool = True, existing: ExternalSignalCache = None):
     event = fetch_event_signal(market.name, market.center_lat, market.center_lng, date)
     news = fetch_news_signal(market.name, date)
-    cached = ExternalSignalCache(
-        market_id=market.id, date=date,
-        event_lift_pct=event["lift_pct"], event_summary=event["summary"],
-        news_lift_pct=news["lift_pct"], news_summary=news["summary"],
-        source=f'{event["source"]}+{news["source"]}',
-    )
-    session.add(cached)
-    session.flush()
+    if existing is not None:
+        # Refreshing a stale cached row in place, rather than inserting a second
+        # row for the same (market_id, date) - that pair is UNIQUE-indexed (see
+        # db.py), so a plain insert here would fail.
+        existing.event_lift_pct = event["lift_pct"]
+        existing.event_summary = event["summary"]
+        existing.news_lift_pct = news["lift_pct"]
+        existing.news_summary = news["summary"]
+        existing.source = f'{event["source"]}+{news["source"]}'
+        existing.fetched_at = datetime.datetime.utcnow()
+        cached = existing
+    else:
+        cached = ExternalSignalCache(
+            market_id=market.id, date=date,
+            event_lift_pct=event["lift_pct"], event_summary=event["summary"],
+            news_lift_pct=news["lift_pct"], news_summary=news["summary"],
+            source=f'{event["source"]}+{news["source"]}',
+        )
+        session.add(cached)
+    if flush:
+        session.flush()
     return cached
 
 
@@ -56,10 +128,7 @@ def _apply_rate_of_change_guardrail(target_price, previous_price):
 
 def batch_predict_base_prices(session, market_id: int) -> dict:
     """Predicts base price for every listing in a market with ONE model.predict()
-    call instead of one per listing. This is the fix for the real bottleneck found
-    when timing the engine against the real dataset: per-listing inference (each
-    building its own single-row DataFrame) was the dominant cost, not the DB.
-    Returns {listing_id: base_price}."""
+    call instead of one per listing. Returns {listing_id: base_price}."""
     bundle = load_market_model(market_id)
     model, feature_columns = bundle["model"], bundle["columns"]
 
@@ -80,13 +149,41 @@ def batch_predict_base_prices(session, market_id: int) -> dict:
             dummies[col] = 0
 
     preds = np.expm1(model.predict(dummies[feature_columns]))
-    return dict(zip(rows["listing_id"], preds))
+    # dict(zip(...)) directly on the pandas Series / numpy array would keep
+    # numpy.int64 keys and numpy.float64 values. psycopg2 has no adapter
+    # registered for either by default - it silently stringifies the value
+    # as "np.float64(...)" and inlines that INTO the SQL text rather than
+    # binding it as a parameter, which Postgres then fails to parse (seen as
+    # `InvalidSchemaName: schema "np" does not exist`). predict_base_price(),
+    # the single-listing sibling of this function, already casts with
+    # float(...) for the same reason - this just applies it batch-wide.
+    return {int(listing_id): float(price) for listing_id, price in zip(rows["listing_id"], preds)}
 
 
-def price_listing_for_date(session, listing: Listing, date: datetime.date, base_price: float = None) -> CalendarDay:
+def price_listing_for_date(
+    session, listing: Listing, date: datetime.date, base_price: float = None,
+    signals=None, previous_price=None, existing_row=None, _skip_lookups=False,
+) -> CalendarDay:
+    """Computes and persists the recommended price for one listing-night.
+
+    signals / previous_price / existing_row are optional pre-fetched inputs
+    used by run_pricing_cycle's batched path to avoid a query per call. When
+    they're not supplied and _skip_lookups is False (the default, and what
+    price_single_listing uses), this falls back to the original per-call
+    lookups so standalone behavior is unchanged.
+    """
     if base_price is None:
         base_price = predict_base_price(listing)
-    signals = get_or_fetch_signals(session, listing.market, date)
+    base_price = float(base_price)  # defensive: guarantees a native float regardless of
+    # caller - run_pricing_cycle passes base_prices.get(listing.id) from
+    # batch_predict_base_prices() (see the fix there for why this matters),
+    # and every arithmetic step below (target, final_price) inherits
+    # base_price's type, so this one cast is enough to keep numpy scalars
+    # out of the CalendarDay row psycopg2 ends up binding.
+
+    if signals is None:
+        signals = get_or_fetch_signals(session, listing.market, date)
+
     season_mod = seasonality_modifier(date)
     aggressiveness_scale = 0.5 + listing.aggressiveness
 
@@ -100,14 +197,20 @@ def price_listing_for_date(session, listing: Listing, date: datetime.date, base_
 
     target = base_price * (1 + net_modifier)
 
-    previous_day = session.query(CalendarDay).filter(
-        CalendarDay.listing_id == listing.id,
-        CalendarDay.date == date - datetime.timedelta(days=1),
-    ).first()
-    previous_price = previous_day.recommended_price if previous_day else None
+    if previous_price is None and not _skip_lookups:
+        previous_day = session.query(CalendarDay).filter(
+            CalendarDay.listing_id == listing.id,
+            CalendarDay.date == date - datetime.timedelta(days=1),
+        ).first()
+        previous_price = previous_day.recommended_price if previous_day else None
 
     target = _apply_rate_of_change_guardrail(target, previous_price)
-    final_price = round(max(listing.min_floor, min(target, listing.max_ceiling)), 2)
+    # float(...) here too: Python's built-in round()/min()/max() preserve whatever
+    # numeric type they're handed (round(numpy.float64, 2) is still numpy.float64),
+    # so without base_price already being native (see the cast above) this could
+    # still hand psycopg2 a numpy scalar even though it looks like an ordinary
+    # round()/min()/max() expression.
+    final_price = float(round(max(listing.min_floor, min(target, listing.max_ceiling)), 2))
     clamped = final_price in (listing.min_floor, listing.max_ceiling)
 
     explanation = build_explanation(
@@ -117,19 +220,21 @@ def price_listing_for_date(session, listing: Listing, date: datetime.date, base_
         date=date, clamped=clamped, floor=listing.min_floor, ceiling=listing.max_ceiling,
     )
 
-    existing = session.query(CalendarDay).filter_by(listing_id=listing.id, date=date).first()
+    if existing_row is None and not _skip_lookups:
+        existing_row = session.query(CalendarDay).filter_by(listing_id=listing.id, date=date).first()
+
     status = "auto_applied" if listing.auto_apply else "pending_approval"
-    if existing:
-        existing.base_model_price = base_price
-        existing.event_modifier_pct = signals.event_lift_pct
-        existing.news_modifier_pct = signals.news_lift_pct
-        existing.seasonal_modifier_pct = season_mod
-        existing.recommended_price = final_price
-        existing.explanation = explanation
+    if existing_row:
+        existing_row.base_model_price = base_price
+        existing_row.event_modifier_pct = signals.event_lift_pct
+        existing_row.news_modifier_pct = signals.news_lift_pct
+        existing_row.seasonal_modifier_pct = season_mod
+        existing_row.recommended_price = final_price
+        existing_row.explanation = explanation
         if listing.auto_apply:
-            existing.live_price = final_price
-            existing.status = "auto_applied"
-        row = existing
+            existing_row.live_price = final_price
+            existing_row.status = "auto_applied"
+        row = existing_row
     else:
         row = CalendarDay(
             listing_id=listing.id, date=date, base_model_price=base_price,
@@ -160,10 +265,8 @@ def build_explanation(market_name, currency, base_price, event_contrib, event_su
         verb, pct = _direction_words(event_contrib)
         clean_summary = event_summary.split(":", 1)[-1].strip().rstrip(".") if event_summary else "a nearby event"
         clean_summary = clean_summary[:1].lower() + clean_summary[1:]
-        if "nearby" not in clean_summary.lower():
-            clean_summary += " nearby"
         sentences.append(
-            f"Due to {clean_summary}, it is recommended to {verb} the "
+            f"Due to the event signal ({clean_summary}), it is recommended to {verb} the "
             f"nightly price by {pct*100:.1f}%."
         )
 
@@ -199,28 +302,77 @@ def build_explanation(market_name, currency, base_price, event_contrib, event_su
 
 
 def run_pricing_cycle(days_ahead: int = 14, market_id: int = None):
-    """Prices every listing for the next `days_ahead` nights. Batches base-price
-    inference per market (see batch_predict_base_prices) so this scales to a real
-    multi-thousand-listing dataset instead of only a single host's handful of
-    listings. Pass market_id to price just one market (e.g. for an interactive
-    dashboard 'run for this market' button)."""
+    """Prices every listing for the next `days_ahead` nights.
+
+    Batches per-market work that used to happen per (listing, date):
+      - base-price inference: one model.predict() call (already batched)
+      - signal lookups: one query for the whole date range instead of one
+        per listing-night (get_or_fetch_signals_batch)
+      - "yesterday's price" lookups: one query per market for the day
+        before the window starts, then tracked in memory while iterating
+        forward through dates for each listing
+      - existing CalendarDay rows: one bulk query per market for the whole
+        window, used to decide insert vs. update without a query per night
+
+    For N listings over D days this cuts DB round trips from roughly
+    O(N*D) down to O(D) plus a few bulk queries per market.
+    """
     session = get_session()
     market_q = session.query(Market)
     if market_id is not None:
         market_q = market_q.filter(Market.id == market_id)
     markets = market_q.all()
     today = datetime.date.today()
+    dates = [today + datetime.timedelta(days=offset) for offset in range(days_ahead)]
     total = 0
 
     for market in markets:
         base_prices = batch_predict_base_prices(session, market.id)
         listings = session.query(Listing).filter(Listing.market_id == market.id).all()
+        if not listings:
+            continue
+        listing_ids = [l.id for l in listings]
+
+        # One query for every date's signal row instead of one per listing-night.
+        signals_by_date = get_or_fetch_signals_batch(session, market, dates)
+
+        # One query for "yesterday's" price per listing, instead of a
+        # CalendarDay lookup inside every single price_listing_for_date call.
+        day_before_window = dates[0] - datetime.timedelta(days=1)
+        previous_prices = dict(
+            session.query(CalendarDay.listing_id, CalendarDay.recommended_price)
+            .filter(
+                CalendarDay.listing_id.in_(listing_ids),
+                CalendarDay.date == day_before_window,
+            )
+            .all()
+        )
+
+        # One bulk query for any CalendarDay rows that already exist in this
+        # window, so each night is an in-memory insert-or-update decision
+        # instead of a per-night existence check.
+        existing_rows = {
+            (row.listing_id, row.date): row
+            for row in session.query(CalendarDay).filter(
+                CalendarDay.listing_id.in_(listing_ids),
+                CalendarDay.date.in_(dates),
+            ).all()
+        }
+
         for listing in listings:
             base_price = base_prices.get(listing.id)
-            for offset in range(days_ahead):
-                date = today + datetime.timedelta(days=offset)
-                price_listing_for_date(session, listing, date, base_price=base_price)
+            running_previous_price = previous_prices.get(listing.id)
+            for date in dates:
+                row = price_listing_for_date(
+                    session, listing, date, base_price=base_price,
+                    signals=signals_by_date[date],
+                    previous_price=running_previous_price,
+                    existing_row=existing_rows.get((listing.id, date)),
+                    _skip_lookups=True,
+                )
+                running_previous_price = row.recommended_price
                 total += 1
+
         session.commit()
         print(f"{market.name}: priced {len(listings)} listings x {days_ahead} nights")
 
@@ -232,7 +384,13 @@ def price_single_listing(listing_id: int, days_ahead: int = 365, start_date: dat
     """Prices ONE listing across a long horizon (a full year by default) - used
     by the host year-calendar view, where a host wants to see pricing across
     the whole year for just their own property, not every listing in the
-    market. Computes the base price once (not per night) for speed."""
+    market. Computes the base price once (not per night) for speed.
+
+    Deliberately left on the original per-date-lookup path (signals=None,
+    previous_price=None, existing_row=None, _skip_lookups=False) since it's
+    only ever pricing a single listing - the batching added to
+    run_pricing_cycle exists specifically to avoid O(listings) repeated
+    work, which doesn't apply to a single-listing call."""
     session = get_session()
     listing = session.query(Listing).get(listing_id)
     if not listing:

@@ -37,6 +37,13 @@ def _listing_frame(session, market_id):
         "review_scores_rating": r.review_scores_rating, "num_reviews": r.num_reviews,
         "room_type": r.room_type, "price": r.price, "listing_id": r.id,
     } for r in rows])
+    if df.empty:
+        # No priced listings for this market yet (e.g. a --sample-per-market load whose
+        # candidate pool came up empty - see diagnose_review_mapping.py). pd.DataFrame([])
+        # has no columns at all, so get_dummies(columns=["room_type"]) below would raise
+        # KeyError on an empty frame. Return as-is; train_all_markets()'s own
+        # `len(df) < 10` check already skips a market with too few rows to train on.
+        return df
     df = pd.get_dummies(df, columns=["room_type"], prefix="room_type")
     return df
 

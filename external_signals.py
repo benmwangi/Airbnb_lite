@@ -19,12 +19,33 @@ import os
 import hashlib
 import datetime
 import requests
+from dotenv import load_dotenv
 
-PREDICTHQ_API_KEY = os.environ.get("PREDICTHQ_API_KEY","HX4mqQ6Q7IvTulPKLapDTRjeAjT5L7e8kCxSfY0M")
-NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY","a15b328e-a1d3-4cbf-8ebf-08940044e50d")
+# Loaded here too (not just in db.py) so this module reads the right keys
+# even if something ever imports it before db.py - see db.py's own
+# load_dotenv() comment for the full explanation and the .env.example file
+# for what to put in .env. override=False (the default) means an explicit
+# `$env:PREDICTHQ_API_KEY = "..."` in the shell always still wins.
+load_dotenv()
+
+PREDICTHQ_API_KEY = os.environ.get("PREDICTHQ_API_KEY", "")
+NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY", "")
 
 PREDICTHQ_EVENTS_URL = "https://api.predicthq.com/v1/events/"
 NEWSAPI_EVERYTHING_URL = "https://newsapi.org/v2/everything"
+
+# Used only by fetch_event_signal's synthetic fallback (no PREDICTHQ_API_KEY set) to name
+# what KIND of event triggered a price lift, instead of one generic "high-impact event"
+# phrase for every synthetic hit. See the fallback's own comment for why these are event
+# categories rather than invented specific event/venue names.
+SYNTHETIC_EVENT_TYPES = [
+    "a simulated major concert",
+    "a simulated large sports event",
+    "a simulated citywide festival",
+    "a simulated big conference",
+    "a simulated public holiday weekend",
+    "a simulated large trade show",
+]
 
 
 def _deterministic_unit(*parts) -> float:
@@ -64,11 +85,19 @@ def fetch_event_signal(market_name: str, lat: float, lng: float, date: datetime.
             return {"lift_pct": 0.0, "summary": f"PredictHQ fetch failed ({e}); no lift applied.",
                     "source": "predicthq_error"}
 
-    # Synthetic fallback: deterministic per market/date, occasional larger "event weekend" spikes
+    # Synthetic fallback: deterministic per market/date, occasional larger "event weekend" spikes.
+    # A second, independently-salted deterministic draw ("event_type" vs. "events") picks which
+    # KIND of event to name, so the same market/date always gets the same specific label instead
+    # of every synthetic hit sharing one generic "high-impact event" phrase. Deliberately a
+    # category ("a simulated major concert"), not an invented specific event/venue name - naming
+    # a fake concert as if it were real would be misleading; naming the kind of event stays
+    # specific while staying honest that it's simulated (see `source` on the returned dict).
     u = _deterministic_unit("events", market_name, date.isoformat())
     if u > 0.85:
+        event_type_index = int(_deterministic_unit("event_type", market_name, date.isoformat()) * len(SYNTHETIC_EVENT_TYPES))
+        event_type = SYNTHETIC_EVENT_TYPES[min(event_type_index, len(SYNTHETIC_EVENT_TYPES) - 1)]
         return {"lift_pct": round(0.12 + (u - 0.85) * 1.2, 3),
-                "summary": "Synthetic: simulated high-impact event nearby.", "source": "synthetic"}
+                "summary": f"Synthetic: {event_type} nearby.", "source": "synthetic"}
     return {"lift_pct": 0.0, "summary": "Synthetic: no notable event.", "source": "synthetic"}
 
 
