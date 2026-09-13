@@ -54,6 +54,12 @@ app.add_middleware(
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ],
+    # Vercel gives every deployment its own subdomain - the production one
+    # (e.g. airbnb-lite.vercel.app) plus a fresh one for every preview build
+    # (airbnb-lite-<hash>-<team>.vercel.app). A fixed allow_origins list can't
+    # keep up with preview URLs, so this regex covers any *.vercel.app origin
+    # in addition to the explicit localhost entries above.
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_methods=["*"],
     allow_headers=["*"],
 )
