@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 from db import get_session, Listing, CalendarDay, Market, ExternalSignalCache
 from pricing_model import predict_base_price, load_market_model, BASE_NUMERIC_COLUMNS
-from external_signals import fetch_event_signal, fetch_news_signal, PREDICTHQ_API_KEY, NEWSAPI_KEY
+from external_signals import fetch_event_signal, fetch_news_signal, OPENWEBNINJA_API_KEY, NEWSAPI_KEY
 
 WEIGHTS = {"event": 0.30, "news": 0.15, "seasonality": 0.20}
 MAX_NIGHT_OVER_NIGHT_CHANGE_PCT = 0.15   # guardrail: no more than +/-15% vs previous night's price
@@ -40,14 +40,17 @@ def seasonality_modifier(date: datetime.date) -> float:
 
 
 def _cache_is_stale(cached: ExternalSignalCache) -> bool:
-    """A row cached before PREDICTHQ_API_KEY/NEWSAPI_KEY were configured
+    """A row cached before OPENWEBNINJA_API_KEY/NEWSAPI_KEY were configured
     would otherwise be reused forever - `source` records exactly what
     fetch_event_signal/fetch_news_signal used at fetch time (see
     _create_signal_cache_row: "{event_source}+{news_source}"), so comparing
     it against whichever keys are CURRENTLY set tells us whether a key was
-    added since this row was cached and it needs a real fetch now."""
+    added since this row was cached and it needs a real fetch now. Also
+    catches rows cached back when this used PredictHQ (source starting with
+    "predicthq") - those are stale under an OpenWeb Ninja key too, since
+    that key was never used to produce them."""
     event_source, _, news_source = cached.source.partition("+")
-    event_stale = bool(PREDICTHQ_API_KEY) and event_source != "predicthq"
+    event_stale = bool(OPENWEBNINJA_API_KEY) and event_source != "openwebninja"
     news_stale = bool(NEWSAPI_KEY) and news_source != "newsapi"
     return event_stale or news_stale
 

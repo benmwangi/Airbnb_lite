@@ -2,11 +2,32 @@
 Sources the two external factors identified: nearby events and relevant news.
 
 Real integrations:
-  - Events: PredictHQ Events API (https://www.predicthq.com) - purpose-built for
-    demand/pricing use cases, not just a raw event calendar: it returns predicted
-    attendance, spend and a relevance rank per event, which is what turns "there's
-    a concert nearby" into an actual price modifier.
-    Get a key at https://control.predicthq.com -> API Keys. Set PREDICTHQ_API_KEY.
+  - Events: OpenWeb Ninja's Real-Time Events Search API
+    (https://www.openwebninja.com/api/real-time-events-search). Previously this
+    used PredictHQ (https://www.predicthq.com), which returned a predicted
+    attendance/spend/rank per event; that key is no longer active, so PredictHQ
+    has been removed rather than kept as a dead fallback. OpenWeb Ninja is a
+    Google Events scrape instead: you search by free-text query ("Events in
+    Austin") rather than a geo radius, and it returns no rank or
+    predicted-attendance figure the way PredictHQ did.
+    Get a key at openwebninja.com and set OPENWEBNINJA_API_KEY. Note that on
+    that site each individual API needs its own subscription even though the
+    key itself is account-wide - visit the API's page and subscribe (a free
+    tier covers this) or every call 403s with "You are not subscribed to this
+    API" regardless of how valid the key is.
+    VERIFIED LIVE (2026-09-14, one real call against "Events in Paris"): the
+    response envelope is a top-level `data` list, as assumed. However, every
+    sampled event's `venue.latitude`/`venue.longitude` came back null - this
+    API does not expose raw venue coordinates (only `full_address` and a
+    Google `cid`/`map_link`). Earlier versions of this integration tried to
+    haversine-filter events against the market's lat/lng using those fields;
+    since they're always null, that filter would have silently discarded
+    every real event and always fallen through to "no events found," with no
+    error to reveal it. Proximity is therefore left entirely to the query
+    text's own city-level scoping - coarser than PredictHQ's 5km radius, but
+    it's what this data source can actually support. `lat`/`lng` stay as
+    parameters (for call-site and synthetic-fallback signature compatibility)
+    but are not used to filter results.
   - News/demand volume: NewsAPI.org - simple headline search by keyword + date.
     Get a key at https://newsapi.org/register. Set NEWSAPI_KEY.
 
@@ -25,19 +46,20 @@ from dotenv import load_dotenv
 # even if something ever imports it before db.py - see db.py's own
 # load_dotenv() comment for the full explanation and the .env.example file
 # for what to put in .env. override=False (the default) means an explicit
-# `$env:PREDICTHQ_API_KEY = "..."` in the shell always still wins.
+# `$env:OPENWEBNINJA_API_KEY = "..."` in the shell always still wins.
 load_dotenv()
 
-PREDICTHQ_API_KEY = os.environ.get("PREDICTHQ_API_KEY", "")
+OPENWEBNINJA_API_KEY = os.environ.get("OPENWEBNINJA_API_KEY", "")
 NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY", "")
 
-PREDICTHQ_EVENTS_URL = "https://api.predicthq.com/v1/events/"
+OPENWEBNINJA_EVENTS_URL = "https://api.openwebninja.com/realtime-events-data/search-events"
 NEWSAPI_EVERYTHING_URL = "https://newsapi.org/v2/everything"
 
-# Used only by fetch_event_signal's synthetic fallback (no PREDICTHQ_API_KEY set) to name
-# what KIND of event triggered a price lift, instead of one generic "high-impact event"
-# phrase for every synthetic hit. See the fallback's own comment for why these are event
-# categories rather than invented specific event/venue names.
+# Used only by fetch_event_signal's synthetic fallback (no OPENWEBNINJA_API_KEY set)
+# to name what KIND of event triggered a price lift, instead of one generic
+# "high-impact event" phrase for every synthetic hit. See the fallback's own
+# comment for why these are event categories rather than invented specific
+# event/venue names.
 SYNTHETIC_EVENT_TYPES = [
     "a simulated major concert",
     "a simulated large sports event",
@@ -56,34 +78,50 @@ def _deterministic_unit(*parts) -> float:
 
 
 def fetch_event_signal(market_name: str, lat: float, lng: float, date: datetime.date) -> dict:
-    """Returns {'lift_pct': float, 'summary': str, 'source': str}"""
-    if PREDICTHQ_API_KEY:
+    """Returns {'lift_pct': float, 'summary': str, 'source': str}
+
+    lat/lng are accepted for call-site compatibility (pricing_engine.py passes
+    market.center_lat/center_lng, same as the old PredictHQ integration used)
+    but are NOT used to filter OpenWeb Ninja results - see the module
+    docstring for why: that API never returns real venue coordinates, so a
+    distance filter against them can't actually work.
+    """
+    if OPENWEBNINJA_API_KEY:
         try:
             resp = requests.get(
-                PREDICTHQ_EVENTS_URL,
-                headers={"Authorization": f"Bearer {PREDICTHQ_API_KEY}"},
-                params={
-                    "within": f"5km@{lat},{lng}",
-                    "active.gte": date.isoformat(),
-                    "active.lte": date.isoformat(),
-                    "rank.gte": 50,          # only events PredictHQ ranks as meaningfully impactful
-                    "sort": "rank",
-                    "limit": 5,
-                },
+                OPENWEBNINJA_EVENTS_URL,
+                headers={"x-api-key": OPENWEBNINJA_API_KEY},
+                # Location lives in the query text (Google Events-style search), not a
+                # radius param - this is what scopes results to market_name at all.
+                params={"query": f"Events in {market_name}"},
                 timeout=10,
             )
             resp.raise_for_status()
-            results = resp.json().get("results", [])
-            if not results:
-                return {"lift_pct": 0.0, "summary": "No high-impact events nearby.", "source": "predicthq"}
-            top = results[0]
-            rank = top.get("rank", 50)
-            lift = min(0.30, (rank - 50) / 150)  # scale PredictHQ rank into a price-lift cap
-            names = ", ".join(e.get("title", "event") for e in results[:3])
-            return {"lift_pct": round(lift, 3), "summary": f"Nearby: {names}", "source": "predicthq"}
+            events = resp.json().get("data", [])  # confirmed live - see module docstring
+
+            matching_on_date = []
+            for event in events:
+                start_raw = event.get("start_time") or event.get("start_time_utc") or ""
+                try:
+                    event_date = datetime.date.fromisoformat(start_raw[:10])
+                except ValueError:
+                    continue  # unparseable date - skip rather than guess it's a match
+                if event_date == date:
+                    matching_on_date.append(event)
+
+            if not matching_on_date:
+                return {"lift_pct": 0.0, "summary": "No events found.", "source": "openwebninja"}
+
+            # No rank/predicted-attendance field like PredictHQ used to give us, so the
+            # lift scales off how many qualifying events land on this date instead -
+            # capped at 0.30, matching the old PredictHQ integration's cap so
+            # pricing_engine.py sees the same range of values as before.
+            lift = min(0.30, 0.10 * len(matching_on_date))
+            names = ", ".join(e.get("name", "event") for e in matching_on_date[:3])
+            return {"lift_pct": round(lift, 3), "summary": f"Nearby: {names}", "source": "openwebninja"}
         except requests.RequestException as e:
-            return {"lift_pct": 0.0, "summary": f"PredictHQ fetch failed ({e}); no lift applied.",
-                    "source": "predicthq_error"}
+            return {"lift_pct": 0.0, "summary": f"OpenWeb Ninja fetch failed ({e}); no lift applied.",
+                    "source": "openwebninja_error"}
 
     # Synthetic fallback: deterministic per market/date, occasional larger "event weekend" spikes.
     # A second, independently-salted deterministic draw ("event_type" vs. "events") picks which
