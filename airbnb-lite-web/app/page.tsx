@@ -41,9 +41,6 @@ export default function LandingPage() {
           </div>
           <div className="flex items-center gap-4">
             <GuestAuthNav />
-            <a href="/host" className="rounded-full border border-[var(--lp-border)] px-4 py-1.5 text-sm transition hover:shadow-[0_1px_4px_rgba(34,32,27,0.08)]">
-              Switch to hosting
-            </a>
           </div>
         </div>
       </header>

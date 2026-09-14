@@ -70,7 +70,6 @@ function ListingPageInner() {
           </a>
           <div className="flex items-center gap-4">
             <GuestAuthNav />
-            <a href="/host" className="rounded-full border border-[var(--lp-border)] px-4 py-1.5 text-sm">Switch to hosting</a>
           </div>
         </div>
       </header>
