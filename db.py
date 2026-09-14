@@ -175,7 +175,7 @@ class ExternalSignalCache(Base):
     news_lift_pct = Column(Float, default=0.0)
     news_summary = Column(Text)
     fetched_at = Column(DateTime, default=datetime.datetime.utcnow)
-    source = Column(String, default="synthetic")  # "predicthq", "newsapi", or "synthetic"
+    source = Column(String, default="synthetic")  # "openwebninja", "newsapi", or "synthetic"
 
 
 class MarketComparison(Base):
