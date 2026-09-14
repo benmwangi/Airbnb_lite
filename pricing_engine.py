@@ -23,6 +23,7 @@ original per-call lookups when the batched inputs aren't supplied, so
 behavior for that caller is unchanged.
 """
 import datetime
+from functools import lru_cache
 import numpy as np
 import pandas as pd
 from db import get_session, Listing, CalendarDay, Market, ExternalSignalCache
@@ -66,13 +67,31 @@ def get_or_fetch_signals(session, market: Market, date: datetime.date):
     return _create_signal_cache_row(session, market, date, existing=cached)
 
 
+@lru_cache(maxsize=256)
+def _cached_news_signal(market_id: int, market_name: str, as_of: datetime.date):
+    """Wraps fetch_news_signal so it's called AT MOST ONCE per (market, day)
+    for the life of this process, no matter how many pricing dates or
+    listings end up asking for it. See fetch_news_signal's docstring: the
+    underlying NewsAPI query is the same regardless of which future night is
+    being priced, so calling it once per date - as this used to do inside
+    _create_signal_cache_row - would multiply API usage by the number of
+    nights/listings involved (e.g. price_single_listing's 365-night year view
+    would otherwise fire 365 separate calls for one listing) and blow well
+    past NewsAPI's 100-requests/day free-tier limit. The cache key naturally
+    "expires" as `as_of` changes day to day, and clears on process restart -
+    no manual invalidation needed."""
+    return fetch_news_signal(market_name, as_of)
+
+
 def get_or_fetch_signals_batch(session, market: Market, dates: list):
     """Returns {date: ExternalSignalCache} for every date in `dates`, issuing
     ONE query for all already-cached rows instead of one query per date.
     Only dates missing from the cache, or whose cached row is stale (see
-    _cache_is_stale), trigger a fetch_event_signal / fetch_news_signal call,
-    and those rows are flushed once at the end rather than one flush per
-    row."""
+    _cache_is_stale), trigger a fetch_event_signal call for that date (real
+    events genuinely vary night to night) plus a _cached_news_signal call
+    (memoized per market per day - see its docstring for why news does NOT
+    vary per date the way events do), and those rows are flushed once at the
+    end rather than one flush per row."""
     existing = {
         row.date: row
         for row in session.query(ExternalSignalCache).filter(
@@ -96,7 +115,12 @@ def get_or_fetch_signals_batch(session, market: Market, dates: list):
 
 def _create_signal_cache_row(session, market: Market, date: datetime.date, flush: bool = True, existing: ExternalSignalCache = None):
     event = fetch_event_signal(market.name, market.center_lat, market.center_lng, date)
-    news = fetch_news_signal(market.name, date)
+    # News is fetched via _cached_news_signal (memoized per market per day), not
+    # fetch_news_signal directly - see that helper's docstring for why: news
+    # isn't meaningfully different from one pricing date to the next the way a
+    # real event is, and fetching it fresh per date would multiply NewsAPI
+    # calls by the number of dates/listings being priced.
+    news = _cached_news_signal(market.id, market.name, datetime.date.today())
     if existing is not None:
         # Refreshing a stale cached row in place, rather than inserting a second
         # row for the same (market_id, date) - that pair is UNIQUE-indexed (see

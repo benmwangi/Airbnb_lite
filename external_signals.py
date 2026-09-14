@@ -28,8 +28,10 @@ Real integrations:
     it's what this data source can actually support. `lat`/`lng` stay as
     parameters (for call-site and synthetic-fallback signature compatibility)
     but are not used to filter results.
-  - News/demand volume: NewsAPI.org - simple headline search by keyword + date.
-    Get a key at https://newsapi.org/register. Set NEWSAPI_KEY.
+  - News/demand volume: NewsAPI.org - headline search by keyword over a rolling
+    recent-days window, NOT per future night (see fetch_news_signal's
+    docstring for why a per-date query can't work for a date that hasn't
+    happened yet). Get a key at https://newsapi.org/register. Set NEWSAPI_KEY.
 
 If no key is set (the default for this demo), each function falls back to a
 seeded-but-deterministic synthetic signal so the rest of the pipeline still runs
@@ -139,16 +141,43 @@ def fetch_event_signal(market_name: str, lat: float, lng: float, date: datetime.
     return {"lift_pct": 0.0, "summary": "Synthetic: no notable event.", "source": "synthetic"}
 
 
-def fetch_news_signal(market_name: str, date: datetime.date) -> dict:
-    """Returns {'lift_pct': float, 'summary': str, 'source': str}"""
+NEWS_LOOKBACK_DAYS = 7  # how many trailing days of coverage fetch_news_signal looks at
+
+
+def fetch_news_signal(market_name: str, as_of: datetime.date = None) -> dict:
+    """Returns {'lift_pct': float, 'summary': str, 'source': str}
+
+    Unlike fetch_event_signal, this is NOT meant to be called once per
+    pricing date. NewsAPI's `from`/`to` filter by an article's PUBLICATION
+    date, not by what date the article is "about" - so "how much travel news
+    is there for night X" only makes sense when X is today or earlier.
+    run_pricing_cycle prices nights from today out to `days_ahead` in the
+    FUTURE, so a per-future-date query would be asking for articles published
+    on dates that haven't happened yet - it can never return anything real.
+    (The Developer/free plan also delays even TODAY's articles by ~24 hours,
+    so "today" isn't fully reliable either.) Callers should fetch this ONCE
+    per market (see pricing_engine.py's _cached_news_signal) and apply the
+    same lift to every date being priced, rather than once per date - besides
+    matching what this data source can actually answer, that also keeps
+    usage well under NewsAPI's 100-requests/day free-tier limit (calling it
+    per date per listing could otherwise mean hundreds of calls for a single
+    pricing run).
+
+    as_of defaults to today; accepted as a parameter (rather than this
+    function always calling datetime.date.today() itself) so a caller or
+    test can pin a specific "now" instead of it silently drifting with
+    wall-clock time.
+    """
+    as_of = as_of or datetime.date.today()
     if NEWSAPI_KEY:
         try:
+            window_start = as_of - datetime.timedelta(days=NEWS_LOOKBACK_DAYS)
             resp = requests.get(
                 NEWSAPI_EVERYTHING_URL,
                 params={
                     "q": f'"{market_name}" AND (tourism OR travel OR visitors)',
-                    "from": date.isoformat(),
-                    "to": date.isoformat(),
+                    "from": window_start.isoformat(),
+                    "to": as_of.isoformat(),
                     "language": "en",
                     "sortBy": "relevancy",
                     "apiKey": NEWSAPI_KEY,
@@ -157,13 +186,15 @@ def fetch_news_signal(market_name: str, date: datetime.date) -> dict:
             )
             resp.raise_for_status()
             total = resp.json().get("totalResults", 0)
-            # more travel-relevant coverage that day -> small positive demand signal
+            # more travel-relevant coverage recently -> small positive demand signal
             lift = min(0.06, total / 500)
-            return {"lift_pct": round(lift, 3), "summary": f"{total} relevant articles.", "source": "newsapi"}
+            return {"lift_pct": round(lift, 3),
+                    "summary": f"{total} relevant articles in the last {NEWS_LOOKBACK_DAYS} days.",
+                    "source": "newsapi"}
         except requests.RequestException as e:
             return {"lift_pct": 0.0, "summary": f"NewsAPI fetch failed ({e}); no lift applied.",
                     "source": "newsapi_error"}
 
-    u = _deterministic_unit("news", market_name, date.isoformat())
+    u = _deterministic_unit("news", market_name, as_of.isoformat())
     lift = round(max(0.0, (u - 0.6) * 0.1), 3)
     return {"lift_pct": lift, "summary": "Synthetic: baseline news/demand volume.", "source": "synthetic"}
