@@ -1,27 +1,36 @@
 "use client";
 
-import { useState } from "react";
+import Image from "next/image";
+import { useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { ListingSummary } from "@/lib/api";
-import { photosForListing, stockPhotoSrc } from "@/lib/photos";
-import { hostNameForHost } from "@/lib/hosts";
 
 export function ListingCard({
   listing,
   nightlyPrice,
+  onPhotoUnavailable,
 }: {
   listing: ListingSummary;
   nightlyPrice: number | null;
+  // Notifies the parent (search results grid) that this card has no photo to
+  // show - either it never had one, or (same reasoning as Gallery.tsx) a
+  // real archive picture_url turned out to be a dead link - so it can be
+  // swapped out for a spare listing instead of leaving a photo-less card in
+  // the results. Optional: other callers (e.g. a future non-search use of
+  // this card) aren't required to handle backfill.
+  onPhotoUnavailable?: (listingId: number) => void;
 }) {
-  const photos = photosForListing(listing.id);
-  const [index, setIndex] = useState(0);
   const searchParams = useSearchParams();
+  const [imageFailed, setImageFailed] = useState(false);
+  const showPlaceholder = !listing.picture_url || imageFailed;
 
-  function go(delta: number, e: React.MouseEvent) {
-    e.preventDefault();
-    e.stopPropagation();
-    setIndex((i) => (i + delta + photos.length) % photos.length);
-  }
+  useEffect(() => {
+    // Fires at most once per card: either immediately on mount (no
+    // picture_url at all) or the one time imageFailed flips true (onError) -
+    // it never flips back, so this never double-reports the same listing.
+    if (showPlaceholder) onPhotoUnavailable?.(listing.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showPlaceholder]);
 
   // Carry the guest's search criteria (dates, guest counts) through to the
   // listing page - without this, clicking through from search results
@@ -38,12 +47,21 @@ export function ListingCard({
   return (
     <a href={href} className="group block">
       <div className="relative overflow-hidden rounded-xl">
-        <img
-          src={stockPhotoSrc(photos[index].id, 500)}
-          alt={photos[index].label}
-          className="h-56 w-full object-cover"
-          loading="lazy"
-        />
+        {showPlaceholder ? (
+          <div className="flex h-56 w-full items-center justify-center bg-[var(--lp-teal-dim)] text-sm text-[var(--lp-teal)]">
+            No photo available
+          </div>
+        ) : (
+          <Image
+            src={listing.picture_url as string}
+            alt={listing.name || `${listing.room_type} in ${listing.market}`}
+            width={640}
+            height={448}
+            className="h-56 w-full object-cover"
+            loading="lazy"
+            onError={() => setImageFailed(true)}
+          />
+        )}
 
         {/* Hover affordance - the whole card already links to the listing page
             (including a click anywhere on the image), so this is purely a
@@ -55,43 +73,15 @@ export function ListingCard({
           </span>
         </div>
 
-        {photos.length > 1 && (
-          <>
-            <button
-              onClick={(e) => go(-1, e)}
-              aria-label="Previous photo"
-              className="absolute left-2 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-full bg-white/90 text-[var(--lp-text)] opacity-0 shadow transition group-hover:opacity-100"
-            >
-              &lsaquo;
-            </button>
-            <button
-              onClick={(e) => go(1, e)}
-              aria-label="Next photo"
-              className="absolute right-2 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-full bg-white/90 text-[var(--lp-text)] opacity-0 shadow transition group-hover:opacity-100"
-            >
-              &rsaquo;
-            </button>
-
-            <div className="absolute bottom-2 left-1/2 flex -translate-x-1/2 gap-1">
-              {photos.map((p, i) => (
-                <span
-                  key={p.id}
-                  className="h-1.5 w-1.5 rounded-full"
-                  style={{ background: i === index ? "white" : "rgba(255,255,255,0.5)" }}
-                />
-              ))}
-            </div>
-          </>
-        )}
       </div>
 
       <div className="mt-2.5 flex items-start justify-between gap-2">
         <p className="text-sm font-medium leading-snug">
-          {listing.room_type} in {listing.market}
+          {listing.name || `${listing.room_type} in ${listing.market}`}
         </p>
         <span className="shrink-0 text-sm">&#9733; {(listing.review_scores_rating / 20).toFixed(1)}</span>
       </div>
-      <p className="text-sm text-[var(--lp-text-muted)]">Hosted by {hostNameForHost(listing.host_id)}</p>
+      <p className="text-sm text-[var(--lp-text-muted)]">{listing.property_type || listing.room_type} · {listing.neighbourhood || listing.market}</p>
       <p className="text-sm text-[var(--lp-text-muted)]">Sleeps {listing.accommodates}{listing.host_is_superhost ? " \u00B7 Superhost" : ""}</p>
       {nightlyPrice != null && (
         <p className="mt-1 text-sm">

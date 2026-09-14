@@ -1,57 +1,121 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { useParams } from "next/navigation";
-import { api, CalendarNight, ListingSummary } from "@/lib/api";
+import { useEffect, useRef, useState } from "react";
+import { useParams, useRouter } from "next/navigation";
+import { api, CalendarNight, HOST_CALENDAR_DAYS, ListingSummary } from "@/lib/api";
 import { MonthCalendar } from "@/components/host/MonthCalendar";
 import { ReviewInsights } from "@/components/host/ReviewInsights";
-import { hostNameForHost } from "@/lib/hosts";
+import { useCurrentUser, logout } from "@/lib/auth";
 
 export default function ManageListingPage() {
   const params = useParams();
+  const router = useRouter();
   const listingId = Number(params.id);
+  const { user, status } = useCurrentUser();
 
   const [listing, setListing] = useState<ListingSummary | null>(null);
   const [nights, setNights] = useState<CalendarNight[]>([]);
   const [selectedDate, setSelectedDate] = useState<string | null>(null);
+  const [comparison, setComparison] = useState<Awaited<ReturnType<typeof api.comparison>> | null>(null);
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState(false);
+  const generatedForListing = useRef<number | null>(null);
 
-  function refresh() {
-    api.calendar(listingId, 365).then((c) => {
-      setNights(c);
-      if (c.length && !selectedDate) setSelectedDate(c[0].date);
-    }).catch(() => {});
+  async function refresh() {
+    const c = await api.calendar(listingId, HOST_CALENDAR_DAYS);
+    if (
+      c.length < HOST_CALENDAR_DAYS &&
+      generatedForListing.current !== listingId
+    ) {
+      generatedForListing.current = listingId;
+      setGenerating(true);
+      await api.priceYear(listingId, HOST_CALENDAR_DAYS);
+      setGenerating(false);
+      return refresh();
+    }
+    setNights(c);
+    if (c.length && !selectedDate) setSelectedDate(c[0].date);
+  }
+
+  function loadCalendar() {
+    refresh().catch(() => {
+      setGenerating(false);
+      setError(true);
+    });
   }
 
   useEffect(() => {
-    if (!listingId) return;
-    api.listing(listingId).then(setListing).catch(() => setError(true));
-    refresh();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    generatedForListing.current = null;
   }, [listingId]);
 
+  function setCalendar(c: CalendarNight[]) {
+      setNights(c);
+      if (c.length && !selectedDate) setSelectedDate(c[0].date);
+  }
+
+  function refreshWithoutGeneration() {
+    api.calendar(listingId, HOST_CALENDAR_DAYS).then(setCalendar).catch(() => setError(true));
+  }
+
+  useEffect(() => {
+    if (status === "unauthenticated") {
+      router.push("/login?role=host");
+      return;
+    }
+    if (status === "authenticated" && user?.role !== "host") {
+      router.push("/");
+      return;
+    }
+    if (!listingId || status !== "authenticated") return;
+    api.listing(listingId).then((l) => {
+      if (l.host_id !== user?.host_id) {
+        router.push("/host"); // logged in as a different host - not their listing
+        return;
+      }
+      setListing(l);
+    }).catch(() => setError(true));
+    api.comparison(listingId).then(setComparison).catch(() => setComparison(null));
+    loadCalendar();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [listingId, status, user]);
+
   async function generateYear() {
+    // Guard against an accidental click: this recomputes recommendations for
+    // every night in the horizon, and for an auto-apply listing that means
+    // the live price guests see updates immediately, not just the
+    // recommendation - so make sure that's what the host actually meant to do.
+    const isRegenerate = nights.length > 30;
+    const confirmed = window.confirm(
+      isRegenerate
+        ? `Regenerate pricing for the next ${HOST_CALENDAR_DAYS} nights? This recalculates every night's recommended price.${
+            listing?.auto_apply
+              ? " Auto-apply is on for this listing, so the live price guests see will update immediately."
+              : " Prices you've already approved or set stay live - only the recommendation changes."
+          }`
+        : `Generate a year of pricing for this listing? This computes a recommended price for the next ${HOST_CALENDAR_DAYS} nights.`
+    );
+    if (!confirmed) return;
+
     setGenerating(true);
-    await api.priceYear(listingId, 365);
-    refresh();
+    await api.priceYear(listingId, HOST_CALENDAR_DAYS);
+    refreshWithoutGeneration();
     setGenerating(false);
   }
 
   async function approve() {
     if (!selectedDate) return;
     await api.approve(listingId, selectedDate);
-    refresh();
+    refreshWithoutGeneration();
   }
   async function override(price: number) {
     if (!selectedDate || Number.isNaN(price)) return;
     await api.approve(listingId, selectedDate, price);
-    refresh();
+    refreshWithoutGeneration();
   }
   async function reject() {
     if (!selectedDate) return;
     await api.reject(listingId, selectedDate);
-    refresh();
+    refreshWithoutGeneration();
   }
 
   const night = nights.find((n) => n.date === selectedDate);
@@ -66,6 +130,9 @@ export default function ManageListingPage() {
         </div>
       </div>
     );
+  }
+  if (status === "loading" || status === "unauthenticated" || (user && user.role !== "host")) {
+    return null;
   }
   if (!listing) return null;
 
@@ -84,9 +151,17 @@ export default function ManageListingPage() {
             <span className="text-[var(--lp-border)]">|</span>
             <a href="/host" className="text-sm text-[var(--lp-text-muted)] transition hover:text-[var(--lp-text)]">&larr; Your listings</a>
           </div>
-          <a href="/" className="rounded-full border border-[var(--lp-border)] px-4 py-1.5 text-sm transition hover:shadow-[0_1px_4px_rgba(34,32,27,0.08)]">
-            View live site
-          </a>
+          <div className="flex items-center gap-3">
+            <a
+              href={`/listing/${listingId}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="rounded-full border border-[var(--lp-border)] px-4 py-1.5 text-sm transition hover:shadow-[0_1px_4px_rgba(34,32,27,0.08)]"
+            >
+              View live listing &#8599;
+            </a>
+            <button onClick={logout} className="text-sm text-[var(--lp-text-muted)] underline">Log out</button>
+          </div>
         </div>
       </header>
 
@@ -95,7 +170,7 @@ export default function ManageListingPage() {
           <div>
             <p className="font-display text-2xl">{listing.room_type} in {listing.market}</p>
             <p className="mt-1 text-sm text-[var(--lp-text-muted)]">
-              Hosted by {hostNameForHost(listing.host_id)} &middot; Sleeps {listing.accommodates} &middot;{" "}
+              {listing.name || listing.room_type} &middot; Sleeps {listing.accommodates} &middot;{" "}
               Guardrail {listing.currency} {listing.min_floor.toLocaleString()}&ndash;{listing.max_ceiling.toLocaleString()}
             </p>
           </div>
@@ -132,6 +207,13 @@ export default function ManageListingPage() {
                       <span className="text-xs text-[var(--lp-text-muted)]">Recommended price</span>
                       <span className="font-mono text-sm">{listing.currency} {night.recommended_price.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
                     </div>
+                    {comparison?.available && comparison.actual_median_price != null && (
+                      <div className="rounded-md border border-[var(--lp-border)] bg-[var(--lp-teal-dim)] px-2.5 py-2 text-[11px] leading-relaxed text-[var(--lp-text)]">
+                        <span className="font-medium text-[var(--lp-teal)]">Inside Airbnb:</span>{" "}
+                        {listing.currency} {Math.round(comparison.model_recommended_price ?? night.recommended_price).toLocaleString()} recommended vs {listing.currency} {Math.round(comparison.actual_median_price).toLocaleString()} nearby median
+                        {comparison.actual_mean_price != null && ` (mean ${listing.currency} ${Math.round(comparison.actual_mean_price).toLocaleString()})`}
+                      </div>
+                    )}
                     <div className="flex items-baseline justify-between border-t border-[var(--lp-border)] pt-2">
                       <span className="text-xs font-medium">Set price (live to guests)</span>
                       <span className={`font-mono text-base font-semibold ${night.live_price != null ? "text-[var(--lp-terracotta)]" : "text-[var(--lp-text-muted)]"}`}>

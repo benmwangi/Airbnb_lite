@@ -1,9 +1,10 @@
 "use client";
 
-import { useState } from "react";
-import { api, CalendarNight } from "@/lib/api";
+import { useEffect, useState } from "react";
+import { api, CalendarNight, MarketComparison } from "@/lib/api";
 import { resolvedGuestPrice, nightsInStayRange } from "@/lib/pricing-display";
 import { GuestPicker, GuestCounts } from "@/components/landing/GuestPicker";
+import { authHeaders, useCurrentUser } from "@/lib/auth";
 
 export function GuestBookingPanel({
   listingId,
@@ -28,7 +29,9 @@ export function GuestBookingPanel({
   maxGuests: number;
   floorPrice: number;
 }) {
+  const { user } = useCurrentUser();
   const [confirmed, setConfirmed] = useState(false);
+  const [comparison, setComparison] = useState<MarketComparison | null>(null);
   const [selectedCheckin, setSelectedCheckin] = useState(checkin ?? nights[0]?.date ?? "");
   const [selectedCheckout, setSelectedCheckout] = useState(checkout ?? nights[nights.length - 1]?.date ?? "");
   const [guests, setGuests] = useState<GuestCounts>({
@@ -36,6 +39,10 @@ export function GuestBookingPanel({
     children: initialChildren || 0,
     infants: initialInfants || 0,
   });
+
+  useEffect(() => {
+    api.comparison(listingId).then(setComparison).catch(() => setComparison(null));
+  }, [listingId]);
 
   const checkinInRange = nights.some((n) => n.date === selectedCheckin);
   const checkoutInRange = nights.some((n) => n.date === selectedCheckout);
@@ -57,14 +64,16 @@ export function GuestBookingPanel({
   async function reserve() {
     if (!stayNights.length) return;
     try {
-      // Approve every night in the stay so each has a real live_price before booking
-      await Promise.all(stayNights.map((n) => api.approve(listingId, n.date)));
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/bookings`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ listing_id: listingId, date: stayNights[0].date }),
-      });
-      if (res.ok) setConfirmed(true);
+      // Book every night in the stay - the total price shown already covers
+      // the whole range, so the booking itself must too, not just the first night.
+      const results = await Promise.all(stayNights.map((n) =>
+        fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"}/bookings`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeaders() },
+          body: JSON.stringify({ listing_id: listingId, date: n.date }),
+        })
+      ));
+      if (results.every((r) => r.ok)) setConfirmed(true);
     } catch {
       // demo booking; ignore network errors here
     }
@@ -81,6 +90,14 @@ export function GuestBookingPanel({
           ? "Some nights use this listing's floor price until the host confirms a final rate"
           : "Reflects the host's approved or set price for these dates"}
       </p>
+
+      {comparison?.available && comparison.actual_median_price != null && comparison.model_recommended_price != null && (
+        <div className="mt-3 rounded-lg border border-[var(--lp-border)] bg-[var(--lp-teal-dim)] px-3 py-2 text-xs text-[var(--lp-text)]">
+          <span className="font-medium text-[var(--lp-teal)]">Market check:</span>{" "}
+          {currency} {Math.round(comparison.model_recommended_price).toLocaleString()} vs {currency} {Math.round(comparison.actual_median_price).toLocaleString()} median nearby
+          {comparison.actual_mean_price != null && ` (mean ${currency} ${Math.round(comparison.actual_mean_price).toLocaleString()})`}
+        </div>
+      )}
 
       <div className="mt-4 rounded-lg border border-[var(--lp-border)] divide-y divide-[var(--lp-border)]">
         <div className="grid grid-cols-2 divide-x divide-[var(--lp-border)]">
@@ -156,6 +173,11 @@ export function GuestBookingPanel({
             Reserve
           </button>
           <p className="mt-2 text-center text-xs text-[var(--lp-text-muted)]">You won&apos;t be charged yet</p>
+          <p className="mt-1 text-center text-xs text-[var(--lp-text-muted)]">
+            {user
+              ? `Booking as ${user.name} \u2014 this trip will appear in your account`
+              : <>Not logged in &mdash; <a href="/login?role=guest" className="underline">log in</a> to see this trip later</>}
+          </p>
         </>
       )}
     </div>

@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import { CalendarNight } from "@/lib/api";
 import { effectiveGuestPrice } from "@/lib/pricing-display";
+import { HOST_CALENDAR_DAYS } from "@/lib/api";
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTH_NAMES = [
@@ -25,21 +26,33 @@ export function MonthCalendar({
   selectedDate: string | null;
   onSelect: (date: string) => void;
 }) {
+  const today = useMemo(() => {
+    const date = new Date();
+    date.setHours(0, 0, 0, 0);
+    return date;
+  }, []);
+  const calendarEnd = useMemo(() => {
+    const date = new Date(today);
+    date.setDate(date.getDate() + HOST_CALENDAR_DAYS);
+    return date;
+  }, [today]);
+
   const byDate = useMemo(() => {
     const m = new Map<string, CalendarNight>();
-    nights.forEach((n) => m.set(n.date, n));
+    nights.forEach((n) => {
+      const date = new Date(`${n.date}T00:00:00`);
+      if (date >= today && date <= calendarEnd) m.set(n.date, n);
+    });
     return m;
-  }, [nights]);
+  }, [nights, calendarEnd, today]);
 
-  const displayPrices = nights.map(effectiveGuestPrice);
+  const availableNights = nights.filter((night) => byDate.has(night.date));
+  const displayPrices = availableNights.map(effectiveGuestPrice);
   const min = displayPrices.length ? Math.min(...displayPrices) : 0;
   const max = displayPrices.length ? Math.max(...displayPrices) : 1;
 
-  const firstNightDate = nights.length ? new Date(nights[0].date + "T00:00:00") : new Date();
-  const lastNightDate = nights.length ? new Date(nights[nights.length - 1].date + "T00:00:00") : new Date();
-
-  const [viewYear, setViewYear] = useState(firstNightDate.getFullYear());
-  const [viewMonth, setViewMonth] = useState(firstNightDate.getMonth());
+  const [viewYear, setViewYear] = useState(today.getFullYear());
+  const [viewMonth, setViewMonth] = useState(today.getMonth());
 
   const monthStart = new Date(viewYear, viewMonth, 1);
   const gridStart = new Date(monthStart);
@@ -54,10 +67,13 @@ export function MonthCalendar({
 
   function heatBackground(price: number, muted: boolean) {
     const t = max > min ? (price - min) / (max - min) : 0.5;
-    const base = t >= 0.5 ? 201 : 33;
-    const g = t >= 0.5 ? 113 : 134;
-    const b = t >= 0.5 ? 74 : 122;
-    const alpha = (muted ? 0.05 : 0.09) + Math.abs(t - 0.5) * (muted ? 0.18 : 0.4);
+    const higherPrice = t >= 0.5;
+    const base = higherPrice ? 22 : 33;
+    const g = higherPrice ? 108 : 134;
+    const b = higherPrice ? 220 : 122;
+    const alpha = higherPrice
+      ? (muted ? 0.1 : 0.16) + Math.abs(t - 0.5) * (muted ? 0.24 : 0.5)
+      : (muted ? 0.05 : 0.09) + Math.abs(t - 0.5) * (muted ? 0.18 : 0.4);
     return `rgba(${base}, ${g}, ${b}, ${alpha.toFixed(2)})`;
   }
 
@@ -69,12 +85,11 @@ export function MonthCalendar({
   }
 
   function canGoPrev() {
-    const prevMonthEnd = new Date(viewYear, viewMonth, 0);
-    return prevMonthEnd >= firstNightDate;
+    return viewYear > today.getFullYear() || viewMonth > today.getMonth();
   }
   function canGoNext() {
     const nextMonthStart = new Date(viewYear, viewMonth + 1, 1);
-    return nextMonthStart <= lastNightDate;
+    return nextMonthStart <= new Date(calendarEnd.getFullYear(), calendarEnd.getMonth(), 1);
   }
 
   function go(delta: number) {
@@ -115,6 +130,7 @@ export function MonthCalendar({
           const key = toKey(d);
           const night = byDate.get(key);
           const inMonth = d.getMonth() === viewMonth;
+          const withinHorizon = d >= today && d <= calendarEnd;
           const selected = key === selectedDate;
           const pending = night?.status === "pending_approval";
           const rejected = night?.status === "rejected";
@@ -123,8 +139,8 @@ export function MonthCalendar({
           return (
             <button
               key={key}
-              disabled={!night}
-              onClick={() => night && onSelect(key)}
+              disabled={!night || !withinHorizon}
+              onClick={() => night && withinHorizon && onSelect(key)}
               className={`flex h-16 flex-col items-start justify-between rounded-md border p-1.5 text-left transition
                 ${!inMonth ? "opacity-30" : ""}
                 ${!night ? "cursor-default border-[var(--lp-border)]" : "hover:brightness-95"}

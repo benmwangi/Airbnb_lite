@@ -6,7 +6,7 @@ import { api, CalendarNight, ListingSummary } from "@/lib/api";
 import { Gallery } from "@/components/listing/Gallery";
 import { HostCard, AmenityGrid, HouseRules, ReviewsSection } from "@/components/listing/InfoSections";
 import { GuestBookingPanel } from "@/components/listing/GuestBookingPanel";
-import { hostNameForHost } from "@/lib/hosts";
+import { GuestAuthNav } from "@/components/GuestAuthNav";
 
 export default function ListingPage() {
   return (
@@ -57,8 +57,6 @@ function ListingPageInner() {
 
   if (!listing) return null;
 
-  const hostName = hostNameForHost(listing.host_id);
-
   return (
     <div className="listing-page">
       <header className="border-b border-[var(--lp-border)]">
@@ -70,50 +68,50 @@ function ListingPageInner() {
             </svg>
             <span className="font-display text-xl italic">airbnb lite</span>
           </a>
-          <a href="/host" className="rounded-full border border-[var(--lp-border)] px-4 py-1.5 text-sm">Switch to hosting</a>
+          <div className="flex items-center gap-4">
+            <GuestAuthNav />
+            <a href="/host" className="rounded-full border border-[var(--lp-border)] px-4 py-1.5 text-sm">Switch to hosting</a>
+          </div>
         </div>
       </header>
 
       <main className="mx-auto max-w-6xl px-6 py-8">
-        <p className="font-display text-3xl">Sun-filled entire home with terrace, {listing.market}</p>
+        <p className="font-display text-3xl">{listing.name || `${listing.room_type} in ${listing.market}`}</p>
         <p className="mt-1 text-sm text-[var(--lp-text-muted)]">
           &#9733; {(listing.review_scores_rating / 20).toFixed(1)} &middot; {listing.review_scores_rating >= 99 ? "Superhost" : "Host"} &middot; {listing.market}
         </p>
 
         <div className="mt-5">
-          <Gallery listingId={listingId} />
+          <Gallery pictureUrl={listing.picture_url ?? null} name={listing.name || listing.room_type} />
         </div>
 
         <div className="mt-10 grid grid-cols-1 gap-10 lg:grid-cols-3">
           <div className="lg:col-span-2">
             <div className="border-b border-[var(--lp-border)] pb-6">
-              <p className="text-lg font-medium">Entire home hosted by {hostName} &middot; {listing.accommodates} guests</p>
+              <p className="text-lg font-medium">{listing.room_type} &middot; {listing.accommodates} guests</p>
               <p className="mt-0.5 text-sm text-[var(--lp-text-muted)]">{listing.room_type} &middot; {listing.accommodates} guests</p>
             </div>
 
             <div className="border-b border-[var(--lp-border)] py-6">
-              <HostCard name={hostName} superhost={listing.host_is_superhost} city={listing.market} />
+              <HostCard name={listing.host_name || "Host"} superhost={listing.host_is_superhost} city={listing.market} hostLocation={listing.host_location ?? null} />
             </div>
 
-            <div className="border-b border-[var(--lp-border)] py-6 text-sm leading-relaxed text-[var(--lp-text-muted)]">
-              A bright, quiet home a few minutes from the center of {listing.market}. Wake up to
-              morning light on the terrace, cook in a fully-stocked kitchen, and settle in for the
-              evening in a space designed for both short stays and longer ones. Close to local
-              cafes, transit, and the neighborhood&apos;s best walking streets.
+            <div className="border-b border-[var(--lp-border)] py-6 text-sm leading-relaxed text-[var(--lp-text-muted)] whitespace-pre-line">
+              {listing.description || "No description provided for this listing."}
             </div>
 
             <div className="border-b border-[var(--lp-border)] py-6">
               <p className="mb-4 text-lg font-medium">What this place offers</p>
-              <AmenityGrid />
+              <AmenityGrid amenities={listing.amenities} />
             </div>
 
             <div className="border-b border-[var(--lp-border)] py-6">
-              <ReviewsSection listingId={listingId} rating={listing.review_scores_rating} count={listing.review_scores_rating >= 99 ? 47 : 12} />
+              <ReviewsSection listingId={listingId} rating={listing.review_scores_rating} count={listing.num_reviews} />
             </div>
 
             <div className="py-6">
               <p className="mb-4 text-lg font-medium">Things to know</p>
-              <HouseRules minFloor={listing.min_floor} maxCeiling={listing.max_ceiling} currency={listing.currency} />
+              <HouseRules minFloor={listing.min_floor} maxCeiling={listing.max_ceiling} currency={listing.currency} rules={listing.house_rules} minimumNights={listing.minimum_nights} maximumNights={listing.maximum_nights} />
             </div>
           </div>
 
