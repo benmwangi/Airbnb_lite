@@ -291,18 +291,42 @@ def init_db():
 
 
 def _sync_postgres_sequences():
-    """Keep serial identity sequences ahead of rows imported with explicit IDs."""
+    """Keep every table's serial identity sequence ahead of rows imported with
+    explicit IDs - e.g. migrate_sqlite_to_postgres.py / reset_and_reload_sample.py
+    preserving the original SQLite row IDs on insert. Without this, Postgres's
+    own nextval() counter stays wherever it was left (often 1, or wherever the
+    last app-driven insert left it) while MAX(id) has moved past it from the
+    explicit-ID load, and the next ordinary insert collides with an existing
+    row: sqlalchemy.exc.IntegrityError: (psycopg2.errors.UniqueViolation)
+    duplicate key value violates unique constraint "<table>_pkey".
+
+    Previously only ran for external_signal_cache - the exact table that hit
+    this in production (Key (id)=(30) already exists on an /pricing/run
+    insert) - but any table with an integer `id` primary key populated by an
+    explicit-ID loader has the same latent bug. Every model in this file uses
+    a plain `id = Column(Integer, primary_key=True)`, so this can safely loop
+    over every table in Base.metadata rather than naming tables one at a time
+    and re-missing the next one."""
     if engine.dialect.name != "postgresql":
         return
     from sqlalchemy import text
 
-    with engine.begin() as conn:
-        for table in ("external_signal_cache",):
-            conn.execute(text(
-                f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), "
-                f"COALESCE((SELECT MAX(id) FROM {table}), 1), "
-                f"(SELECT COUNT(*) > 0 FROM {table}))"
-            ))
+    # One transaction PER TABLE, not one for the whole loop - a table whose
+    # `id` column isn't actually serial-backed (pg_get_serial_sequence
+    # returns NULL, setval(NULL, ...) errors) would otherwise abort a single
+    # shared transaction and take every other table's sync down with it,
+    # turning this safety check into a startup crash. Same tolerate-and-move-on
+    # style as _ensure_column/_ensure_index below.
+    for table in Base.metadata.tables:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), "
+                    f"COALESCE((SELECT MAX(id) FROM {table}), 1), "
+                    f"(SELECT COUNT(*) > 0 FROM {table}))"
+                ))
+        except Exception:
+            pass  # no serial `id` column on this table, or table doesn't exist yet - fine
 
 
 def _ensure_column(table: str, column: str, sql_type: str):
