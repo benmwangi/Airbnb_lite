@@ -2,13 +2,50 @@
 Sources the two external factors identified: nearby events and relevant news.
 
 Real integrations:
-  - Events: PredictHQ Events API (https://www.predicthq.com) - purpose-built for
-    demand/pricing use cases, not just a raw event calendar: it returns predicted
-    attendance, spend and a relevance rank per event, which is what turns "there's
-    a concert nearby" into an actual price modifier.
-    Get a key at https://control.predicthq.com -> API Keys. Set PREDICTHQ_API_KEY.
-  - News/demand volume: NewsAPI.org - simple headline search by keyword + date.
-    Get a key at https://newsapi.org/register. Set NEWSAPI_KEY.
+  - Events: OpenWeb Ninja's Real-Time Events Search API
+    (https://www.openwebninja.com/api/real-time-events-search). Previously this
+    used PredictHQ (https://www.predicthq.com), which returned a predicted
+    attendance/spend/rank per event; that key is no longer active, so PredictHQ
+    has been removed rather than kept as a dead fallback. OpenWeb Ninja is a
+    Google Events scrape instead: you search by free-text query ("Events in
+    Austin") rather than a geo radius, and it returns no rank or
+    predicted-attendance figure the way PredictHQ did.
+    Get a key at openwebninja.com and set OPENWEBNINJA_API_KEY. Note that on
+    that site each individual API needs its own subscription even though the
+    key itself is account-wide - visit the API's page and subscribe (a free
+    tier covers this) or every call 403s with "You are not subscribed to this
+    API" regardless of how valid the key is.
+    ON THE PRO PLAN (10,000 requests/month): that monthly ceiling is generous,
+    but it does NOT by itself prevent 429s - Pro-plan production incidents on
+    2026-09-14/15 showed a 429 (burst/per-minute rate limit) followed by
+    back-to-back read timeouts, all while nowhere near 10,000 calls for the
+    month. A host's full-year price view fires up to 365 fetch_event_signal
+    calls in one request with no pacing between them, which is enough to trip
+    a short-window rate limit even on a plan with plenty of monthly headroom
+    left. See _request_with_retry below and pricing_engine.py's
+    EVENT_FETCH_PACING_SECONDS for the two-part fix: pace the calls so a big
+    batch doesn't burst in the first place, and retry-with-backoff so a 429 or
+    timeout that slips through anyway is recovered instead of permanently
+    cached as an error (see pricing_engine.py's _cache_is_stale - an
+    "..._error" row is always retried on the next pricing run, so the failure
+    you actually need to fix is the live one, not a stuck cache).
+    VERIFIED LIVE (2026-09-14, one real call against "Events in Paris"): the
+    response envelope is a top-level `data` list, as assumed. However, every
+    sampled event's `venue.latitude`/`venue.longitude` came back null - this
+    API does not expose raw venue coordinates (only `full_address` and a
+    Google `cid`/`map_link`). Earlier versions of this integration tried to
+    haversine-filter events against the market's lat/lng using those fields;
+    since they're always null, that filter would have silently discarded
+    every real event and always fallen through to "no events found," with no
+    error to reveal it. Proximity is therefore left entirely to the query
+    text's own city-level scoping - coarser than PredictHQ's 5km radius, but
+    it's what this data source can actually support. `lat`/`lng` stay as
+    parameters (for call-site and synthetic-fallback signature compatibility)
+    but are not used to filter results.
+  - News/demand volume: NewsAPI.org - headline search by keyword over a rolling
+    recent-days window, NOT per future night (see fetch_news_signal's
+    docstring for why a per-date query can't work for a date that hasn't
+    happened yet). Get a key at https://newsapi.org/register. Set NEWSAPI_KEY.
 
 If no key is set (the default for this demo), each function falls back to a
 seeded-but-deterministic synthetic signal so the rest of the pipeline still runs
@@ -16,6 +53,8 @@ end to end. The `source` field on every result tells you which path was used -
 check that field before trusting a number in a real deployment.
 """
 import os
+import time
+import random
 import hashlib
 import datetime
 import requests
@@ -25,19 +64,75 @@ from dotenv import load_dotenv
 # even if something ever imports it before db.py - see db.py's own
 # load_dotenv() comment for the full explanation and the .env.example file
 # for what to put in .env. override=False (the default) means an explicit
-# `$env:PREDICTHQ_API_KEY = "..."` in the shell always still wins.
+# `$env:OPENWEBNINJA_API_KEY = "..."` in the shell always still wins.
 load_dotenv()
 
-PREDICTHQ_API_KEY = os.environ.get("PREDICTHQ_API_KEY", "")
+OPENWEBNINJA_API_KEY = os.environ.get("OPENWEBNINJA_API_KEY", "")
 NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY", "")
 
-PREDICTHQ_EVENTS_URL = "https://api.predicthq.com/v1/events/"
+OPENWEBNINJA_EVENTS_URL = "https://api.openwebninja.com/realtime-events-data/search-events"
 NEWSAPI_EVERYTHING_URL = "https://newsapi.org/v2/everything"
 
-# Used only by fetch_event_signal's synthetic fallback (no PREDICTHQ_API_KEY set) to name
-# what KIND of event triggered a price lift, instead of one generic "high-impact event"
-# phrase for every synthetic hit. See the fallback's own comment for why these are event
-# categories rather than invented specific event/venue names.
+# Status codes worth retrying: 429 (rate limit) and the usual transient 5xx
+# server errors. Anything else (401/403/404/etc) is a real, non-transient
+# problem - retrying it would just fail identically every time, so those are
+# raised immediately with no retry loop.
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+_MAX_ATTEMPTS = 3  # 1 initial try + 2 retries
+_RETRY_BASE_DELAY_SECONDS = 1.5  # doubles each attempt: ~1.5s, ~3s
+_MAX_RETRY_AFTER_SECONDS = 10  # cap in case a server sends an unreasonable Retry-After
+
+
+def _request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
+    """requests.request() wrapper with retry-with-backoff for transient
+    failures only: a 429/5xx response, or a read/connect timeout. Both showed
+    up in production against OpenWeb Ninja's Pro plan (see module docstring)
+    even though the monthly quota wasn't close to exhausted - a burst of
+    calls (e.g. a 365-night host year view) can still trip a short-window
+    rate limit, and OpenWeb Ninja's servers evidently slow down/time out
+    under that same throttling rather than always returning a clean 429.
+
+    Honors a numeric Retry-After header on a 429/5xx when the server sends
+    one (capped at _MAX_RETRY_AFTER_SECONDS so a misbehaving server can't
+    stall a pricing run indefinitely); otherwise falls back to exponential
+    backoff with a little jitter so concurrent callers don't all retry in
+    lockstep.
+
+    A non-transient HTTP error (401, 403, 404, ...) is NOT retried - raised
+    immediately via raise_for_status() on the first attempt, same as before
+    this wrapper existed, since retrying a "not subscribed to this API" 403
+    three times wastes time and produces the same failure regardless.
+    """
+    last_exception = None
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            resp = requests.request(method, url, **kwargs)
+        except requests.Timeout as e:
+            last_exception = e
+            if attempt == _MAX_ATTEMPTS - 1:
+                raise
+            time.sleep(_RETRY_BASE_DELAY_SECONDS * (2 ** attempt) + random.uniform(0, 0.5))
+            continue
+
+        if resp.status_code in _RETRYABLE_STATUS_CODES and attempt < _MAX_ATTEMPTS - 1:
+            retry_after_header = resp.headers.get("Retry-After")
+            if retry_after_header and retry_after_header.isdigit():
+                delay = min(float(retry_after_header), _MAX_RETRY_AFTER_SECONDS)
+            else:
+                delay = _RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
+            time.sleep(delay + random.uniform(0, 0.5))
+            continue
+
+        resp.raise_for_status()  # non-transient error -> raised immediately; success -> no-op
+        return resp
+
+    raise last_exception  # pragma: no cover - loop above always returns or raises first
+
+# Used only by fetch_event_signal's synthetic fallback (no OPENWEBNINJA_API_KEY set)
+# to name what KIND of event triggered a price lift, instead of one generic
+# "high-impact event" phrase for every synthetic hit. See the fallback's own
+# comment for why these are event categories rather than invented specific
+# event/venue names.
 SYNTHETIC_EVENT_TYPES = [
     "a simulated major concert",
     "a simulated large sports event",
@@ -56,34 +151,56 @@ def _deterministic_unit(*parts) -> float:
 
 
 def fetch_event_signal(market_name: str, lat: float, lng: float, date: datetime.date) -> dict:
-    """Returns {'lift_pct': float, 'summary': str, 'source': str}"""
-    if PREDICTHQ_API_KEY:
+    """Returns {'lift_pct': float, 'summary': str, 'source': str}
+
+    lat/lng are accepted for call-site compatibility (pricing_engine.py passes
+    market.center_lat/center_lng, same as the old PredictHQ integration used)
+    but are NOT used to filter OpenWeb Ninja results - see the module
+    docstring for why: that API never returns real venue coordinates, so a
+    distance filter against them can't actually work.
+    """
+    if OPENWEBNINJA_API_KEY:
         try:
-            resp = requests.get(
-                PREDICTHQ_EVENTS_URL,
-                headers={"Authorization": f"Bearer {PREDICTHQ_API_KEY}"},
-                params={
-                    "within": f"5km@{lat},{lng}",
-                    "active.gte": date.isoformat(),
-                    "active.lte": date.isoformat(),
-                    "rank.gte": 50,          # only events PredictHQ ranks as meaningfully impactful
-                    "sort": "rank",
-                    "limit": 5,
-                },
-                timeout=10,
+            resp = _request_with_retry(
+                "GET",
+                OPENWEBNINJA_EVENTS_URL,
+                headers={"x-api-key": OPENWEBNINJA_API_KEY},
+                # Location lives in the query text (Google Events-style search), not a
+                # radius param - this is what scopes results to market_name at all.
+                params={"query": f"Events in {market_name}"},
+                # 15s, not 10s: the 2026-09-14/15 Pro-plan read timeouts came in right
+                # after a 429, consistent with OpenWeb Ninja's servers being slow under
+                # the same throttling rather than a hard block - a bit more headroom
+                # here means fewer of those get treated as a hard failure. Retries
+                # (see _request_with_retry) are still the primary defense; this just
+                # makes a single slow-but-real response less likely to be cut off.
+                timeout=15,
             )
-            resp.raise_for_status()
-            results = resp.json().get("results", [])
-            if not results:
-                return {"lift_pct": 0.0, "summary": "No high-impact events nearby.", "source": "predicthq"}
-            top = results[0]
-            rank = top.get("rank", 50)
-            lift = min(0.30, (rank - 50) / 150)  # scale PredictHQ rank into a price-lift cap
-            names = ", ".join(e.get("title", "event") for e in results[:3])
-            return {"lift_pct": round(lift, 3), "summary": f"Nearby: {names}", "source": "predicthq"}
+            events = resp.json().get("data", [])  # confirmed live - see module docstring
+
+            matching_on_date = []
+            for event in events:
+                start_raw = event.get("start_time") or event.get("start_time_utc") or ""
+                try:
+                    event_date = datetime.date.fromisoformat(start_raw[:10])
+                except ValueError:
+                    continue  # unparseable date - skip rather than guess it's a match
+                if event_date == date:
+                    matching_on_date.append(event)
+
+            if not matching_on_date:
+                return {"lift_pct": 0.0, "summary": "No events found.", "source": "openwebninja"}
+
+            # No rank/predicted-attendance field like PredictHQ used to give us, so the
+            # lift scales off how many qualifying events land on this date instead -
+            # capped at 0.30, matching the old PredictHQ integration's cap so
+            # pricing_engine.py sees the same range of values as before.
+            lift = min(0.30, 0.10 * len(matching_on_date))
+            names = ", ".join(e.get("name", "event") for e in matching_on_date[:3])
+            return {"lift_pct": round(lift, 3), "summary": f"Nearby: {names}", "source": "openwebninja"}
         except requests.RequestException as e:
-            return {"lift_pct": 0.0, "summary": f"PredictHQ fetch failed ({e}); no lift applied.",
-                    "source": "predicthq_error"}
+            return {"lift_pct": 0.0, "summary": f"OpenWeb Ninja fetch failed ({e}); no lift applied.",
+                    "source": "openwebninja_error"}
 
     # Synthetic fallback: deterministic per market/date, occasional larger "event weekend" spikes.
     # A second, independently-salted deterministic draw ("event_type" vs. "events") picks which
@@ -101,31 +218,68 @@ def fetch_event_signal(market_name: str, lat: float, lng: float, date: datetime.
     return {"lift_pct": 0.0, "summary": "Synthetic: no notable event.", "source": "synthetic"}
 
 
-def fetch_news_signal(market_name: str, date: datetime.date) -> dict:
-    """Returns {'lift_pct': float, 'summary': str, 'source': str}"""
+NEWS_LOOKBACK_DAYS = 7  # how many trailing days of coverage fetch_news_signal looks at
+
+
+def fetch_news_signal(market_name: str, as_of: datetime.date = None) -> dict:
+    """Returns {'lift_pct': float, 'summary': str, 'source': str}
+
+    Unlike fetch_event_signal, this is NOT meant to be called once per
+    pricing date. NewsAPI's `from`/`to` filter by an article's PUBLICATION
+    date, not by what date the article is "about" - so "how much travel news
+    is there for night X" only makes sense when X is today or earlier.
+    run_pricing_cycle prices nights from today out to `days_ahead` in the
+    FUTURE, so a per-future-date query would be asking for articles published
+    on dates that haven't happened yet - it can never return anything real.
+    (The Developer/free plan also delays even TODAY's articles by ~24 hours,
+    so "today" isn't fully reliable either.) Callers should fetch this ONCE
+    per market (see pricing_engine.py's _cached_news_signal) and apply the
+    same lift to every date being priced, rather than once per date - besides
+    matching what this data source can actually answer, that also keeps
+    usage well under NewsAPI's 100-requests/day free-tier limit (calling it
+    per date per listing could otherwise mean hundreds of calls for a single
+    pricing run).
+
+    as_of defaults to today; accepted as a parameter (rather than this
+    function always calling datetime.date.today() itself) so a caller or
+    test can pin a specific "now" instead of it silently drifting with
+    wall-clock time.
+    """
+    as_of = as_of or datetime.date.today()
     if NEWSAPI_KEY:
         try:
-            resp = requests.get(
+            window_start = as_of - datetime.timedelta(days=NEWS_LOOKBACK_DAYS)
+            resp = _request_with_retry(
+                "GET",
                 NEWSAPI_EVERYTHING_URL,
                 params={
                     "q": f'"{market_name}" AND (tourism OR travel OR visitors)',
-                    "from": date.isoformat(),
-                    "to": date.isoformat(),
+                    "from": window_start.isoformat(),
+                    "to": as_of.isoformat(),
                     "language": "en",
                     "sortBy": "relevancy",
                     "apiKey": NEWSAPI_KEY,
                 },
-                timeout=10,
+                timeout=15,
             )
-            resp.raise_for_status()
+            # NOTE: retries here only help a TRANSIENT failure (429/5xx/timeout). If
+            # every call is failing, that's more likely NewsAPI's free "Developer"
+            # plan blocking requests from a deployed/production server outright
+            # (documented as dev-only, not licensed for live projects) rather than
+            # something backoff can recover from - check the actual error message
+            # this produces (it's cached verbatim on ExternalSignalCache.news_summary)
+            # and NewsAPI's own dashboard for the key's plan/quota status before
+            # assuming retries alone will fix a persistently-failing news signal.
             total = resp.json().get("totalResults", 0)
-            # more travel-relevant coverage that day -> small positive demand signal
+            # more travel-relevant coverage recently -> small positive demand signal
             lift = min(0.06, total / 500)
-            return {"lift_pct": round(lift, 3), "summary": f"{total} relevant articles.", "source": "newsapi"}
+            return {"lift_pct": round(lift, 3),
+                    "summary": f"{total} relevant articles in the last {NEWS_LOOKBACK_DAYS} days.",
+                    "source": "newsapi"}
         except requests.RequestException as e:
             return {"lift_pct": 0.0, "summary": f"NewsAPI fetch failed ({e}); no lift applied.",
                     "source": "newsapi_error"}
 
-    u = _deterministic_unit("news", market_name, date.isoformat())
+    u = _deterministic_unit("news", market_name, as_of.isoformat())
     lift = round(max(0.0, (u - 0.6) * 0.1), 3)
     return {"lift_pct": lift, "summary": "Synthetic: baseline news/demand volume.", "source": "synthetic"}

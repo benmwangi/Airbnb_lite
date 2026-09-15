@@ -35,7 +35,21 @@ load_dotenv()
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./airbnb_lite.db")
 
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, connect_args=connect_args)
+# pool_pre_ping: issues a cheap "SELECT 1" before handing out any pooled
+# connection and transparently reconnects if that fails, instead of raising
+# on the caller's real query. Needed because Neon's free tier auto-suspends
+# its compute after a few minutes idle, which closes the TCP/SSL connection
+# from the DB side - the app's connection pool doesn't find out until it
+# tries to reuse that now-dead connection, which failed as:
+#   sqlalchemy.exc.OperationalError: (psycopg2.OperationalError)
+#   SSL connection has been closed unexpectedly
+# pool_recycle proactively discards any pooled connection older than 280s
+# (just under Neon's ~5min default suspend window) so a connection is
+# rarely old enough to have gone stale in the first place - pre_ping is
+# the safety net for whatever recycle doesn't catch. Both are no-ops for
+# the local SQLite fallback (single file handle, nothing to go stale), so
+# they're left on unconditionally rather than branched on DATABASE_URL.
+engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_pre_ping=True, pool_recycle=280)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
@@ -161,7 +175,7 @@ class ExternalSignalCache(Base):
     news_lift_pct = Column(Float, default=0.0)
     news_summary = Column(Text)
     fetched_at = Column(DateTime, default=datetime.datetime.utcnow)
-    source = Column(String, default="synthetic")  # "predicthq", "newsapi", or "synthetic"
+    source = Column(String, default="synthetic")  # "openwebninja", "newsapi", or "synthetic"
 
 
 class MarketComparison(Base):
@@ -277,18 +291,42 @@ def init_db():
 
 
 def _sync_postgres_sequences():
-    """Keep serial identity sequences ahead of rows imported with explicit IDs."""
+    """Keep every table's serial identity sequence ahead of rows imported with
+    explicit IDs - e.g. migrate_sqlite_to_postgres.py / reset_and_reload_sample.py
+    preserving the original SQLite row IDs on insert. Without this, Postgres's
+    own nextval() counter stays wherever it was left (often 1, or wherever the
+    last app-driven insert left it) while MAX(id) has moved past it from the
+    explicit-ID load, and the next ordinary insert collides with an existing
+    row: sqlalchemy.exc.IntegrityError: (psycopg2.errors.UniqueViolation)
+    duplicate key value violates unique constraint "<table>_pkey".
+
+    Previously only ran for external_signal_cache - the exact table that hit
+    this in production (Key (id)=(30) already exists on an /pricing/run
+    insert) - but any table with an integer `id` primary key populated by an
+    explicit-ID loader has the same latent bug. Every model in this file uses
+    a plain `id = Column(Integer, primary_key=True)`, so this can safely loop
+    over every table in Base.metadata rather than naming tables one at a time
+    and re-missing the next one."""
     if engine.dialect.name != "postgresql":
         return
     from sqlalchemy import text
 
-    with engine.begin() as conn:
-        for table in ("external_signal_cache",):
-            conn.execute(text(
-                f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), "
-                f"COALESCE((SELECT MAX(id) FROM {table}), 1), "
-                f"(SELECT COUNT(*) > 0 FROM {table}))"
-            ))
+    # One transaction PER TABLE, not one for the whole loop - a table whose
+    # `id` column isn't actually serial-backed (pg_get_serial_sequence
+    # returns NULL, setval(NULL, ...) errors) would otherwise abort a single
+    # shared transaction and take every other table's sync down with it,
+    # turning this safety check into a startup crash. Same tolerate-and-move-on
+    # style as _ensure_column/_ensure_index below.
+    for table in Base.metadata.tables:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), "
+                    f"COALESCE((SELECT MAX(id) FROM {table}), 1), "
+                    f"(SELECT COUNT(*) > 0 FROM {table}))"
+                ))
+        except Exception:
+            pass  # no serial `id` column on this table, or table doesn't exist yet - fine
 
 
 def _ensure_column(table: str, column: str, sql_type: str):

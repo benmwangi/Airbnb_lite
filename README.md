@@ -53,7 +53,7 @@ copy .env.example .env
 `.env` is gitignored (the repo's `.env*` rule, same as `.env.local`), so it's
 never committed - only `.env.example` (the template, with no real values) is.
 `db.py` and `external_signals.py` both call `python-dotenv`'s `load_dotenv()`
-before reading any of `DATABASE_URL`, `PREDICTHQ_API_KEY`, or `NEWSAPI_KEY`,
+before reading any of `DATABASE_URL`, `OPENWEBNINJA_API_KEY`, or `NEWSAPI_KEY`,
 so once `.env` exists, every entry point (`uvicorn`, `insideairbnb_loader.py`,
 `reset_and_reload_sample.py`, `pricing_engine.py`, ...) picks them up
 automatically - no more `$env:DATABASE_URL = "..."` in every new terminal. An
@@ -283,15 +283,18 @@ seasonality modifiers, then enforces host-configured floor/ceiling and
 night-over-night change guardrails. Hosts approve, override, or reject
 recommendations through the Next.js host console.
 
-Optional event/news integrations use `PREDICTHQ_API_KEY` and `NEWSAPI_KEY`
-(set them in `.env` - see "Environment variables" above). Without those keys,
-the pricing engine uses its configured deterministic fallback signals; this
-does not change the listing or review source. Each market/date's signal
-lookup is cached in `external_signal_cache` so it isn't re-fetched on every
-pricing run; adding a key after some dates are already cached still works -
-`_cache_is_stale()` in `pricing_engine.py` detects that a cached row predates
-the key and refetches it for real instead of reusing the old synthetic
-value.
+Optional event/news integrations use `OPENWEBNINJA_API_KEY` and `NEWSAPI_KEY`
+(set them in `.env` - see "Environment variables" above). The events signal
+previously used PredictHQ's API; that key is no longer active, so the events
+integration has been switched to OpenWeb Ninja's Real-Time Events Search API
+(see `external_signals.py` for the details and caveats of that integration).
+Without either key set, the pricing engine uses its configured deterministic
+fallback signals; this does not change the listing or review source. Each
+market/date's signal lookup is cached in `external_signal_cache` so it isn't
+re-fetched on every pricing run; adding a key after some dates are already
+cached still works - `_cache_is_stale()` in `pricing_engine.py` detects that
+a cached row predates the key (or was cached under the old PredictHQ
+integration) and refetches it for real instead of reusing the old value.
 
 ## Data and secrets
 
