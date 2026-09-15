@@ -7,6 +7,21 @@ python-dotenv
 joblib
 numpy
 pandas
-scikit-learn
+# Pinned to an exact version, not left open-ended: the 10 models/market_*.joblib
+# files committed to this repo were trained and pickled under scikit-learn 1.9.0
+# (see pricing_model.py's train_all_markets(), which was run locally and its
+# output committed rather than retrained on every deploy). An unpinned
+# scikit-learn let Render's build pick up 1.9.1 on 2026-09-15, which loaded the
+# 1.9.0 models fine but logged InconsistentVersionWarning on every one
+# ("might lead to breaking code or invalid results") - correct today because
+# the format didn't actually change between these versions, but not something
+# to rely on across arbitrary version drift. Pinning keeps the runtime matched
+# to what's actually on disk. To move to a newer scikit-learn on purpose, bump
+# this pin AND rerun `python pricing_model.py` to regenerate all 10
+# models/market_*.joblib files under the new version, then commit both
+# together - train_all_markets() is fully deterministic (fixed random_state on
+# both the train/test split and the forest) given the same DB contents, so
+# this is a safe, reproducible retrain rather than a fresh/different model.
+scikit-learn==1.9.0
 requests
 streamlit

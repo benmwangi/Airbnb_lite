@@ -46,6 +46,30 @@ MAX_NIGHT_OVER_NIGHT_CHANGE_PCT = 0.15   # guardrail: no more than +/-15% vs pre
 # still slips through despite the pacing.
 EVENT_FETCH_PACING_SECONDS = 0.3
 
+# After this many CONSECUTIVE OpenWeb Ninja failures within one
+# get_or_fetch_signals_batch run, stop calling it for the rest of that
+# batch's stale dates - see 2026-09-15's production crash: with retries (up
+# to 3 attempts x 15s timeout each) paid on EVERY stale date while the
+# endpoint was fully down, a run with several stale dates held its one DB
+# session open for minutes doing nothing but timing out, long enough that
+# Neon killed the idle connection out from under it (pool_pre_ping/
+# pool_recycle in db.py only protect a connection being freshly checked OUT
+# of the pool - not one already checked out and just sitting idle mid-batch)
+# and the eventual flush crashed with "SSL connection has been closed
+# unexpectedly". Tripping the breaker after 2 straight failures bounds a
+# fully-down run to roughly 2 dates' worth of retry time instead of
+# len(dates) x worst-case, at the cost of a few dates staying "..._error"
+# for one extra pricing run before being retried (see _cache_is_stale - they
+# ARE retried next time, this isn't a permanent skip).
+EVENT_CIRCUIT_BREAKER_THRESHOLD = 2
+
+# Flush every this-many real fetches within one batch, instead of only once
+# at the very end - so a batch that does eventually hit the same dead-
+# connection failure loses at most this many rows' worth of work, not the
+# whole run, and so the DB connection gets touched periodically rather than
+# sitting untouched for the entire batch.
+SIGNAL_BATCH_FLUSH_EVERY = 5
+
 
 def seasonality_modifier(date: datetime.date) -> float:
     weekend_lift = 0.07 if date.weekday() in (4, 5) else 0.0   # Fri/Sat
@@ -103,14 +127,25 @@ def get_or_fetch_signals_batch(session, market: Market, dates: list):
     _cache_is_stale), trigger a fetch_event_signal call for that date (real
     events genuinely vary night to night) plus a _cached_news_signal call
     (memoized per market per day - see its docstring for why news does NOT
-    vary per date the way events do), and those rows are flushed once at the
-    end rather than one flush per row.
+    vary per date the way events do), and those rows are flushed every
+    SIGNAL_BATCH_FLUSH_EVERY real fetches (plus once more at the end for the
+    remainder) rather than one flush per row or only one for the whole batch.
 
     A real fetch_event_signal call is paced EVENT_FETCH_PACING_SECONDS apart
     from the previous one in this same batch (see that constant's comment) -
     a large batch (e.g. a host's 365-night year view) would otherwise fire
     every OpenWeb Ninja call back-to-back with nothing throttling it, which is
-    what tripped a 429 in production even on a generous monthly quota."""
+    what tripped a 429 in production even on a generous monthly quota.
+
+    If OpenWeb Ninja fails EVENT_CIRCUIT_BREAKER_THRESHOLD times in a row
+    within this batch, the breaker trips: remaining stale dates skip the real
+    fetch entirely (see _create_signal_cache_row's skip_event_fetch) instead
+    of each paying the full retry+backoff cost against an endpoint that's
+    already shown it's down. See that constant's comment for the production
+    incident this fixes - a fully-down endpoint with retries enabled could
+    previously hold this function's one DB session open for minutes doing
+    nothing but timing out, long enough for Neon to close the idle
+    connection out from under it."""
     existing = {
         row.date: row
         for row in session.query(ExternalSignalCache).filter(
@@ -119,25 +154,61 @@ def get_or_fetch_signals_batch(session, market: Market, dates: list):
         ).all()
     }
     result = {}
-    created_any = False
+    fetch_count = 0
+    unflushed_count = 0
+    consecutive_event_failures = 0
     for date in dates:
         cached = existing.get(date)
         if cached is not None and not _cache_is_stale(cached):
             result[date] = cached
-        else:
-            if created_any:
-                # Not the first real fetch in this batch - pace it behind the
-                # previous one instead of firing every call back-to-back.
-                time.sleep(EVENT_FETCH_PACING_SECONDS)
-            result[date] = _create_signal_cache_row(session, market, date, flush=False, existing=cached)
-            created_any = True
-    if created_any:
+            continue
+
+        breaker_tripped = consecutive_event_failures >= EVENT_CIRCUIT_BREAKER_THRESHOLD
+        if fetch_count > 0 and not breaker_tripped:
+            # Not the first real fetch in this batch - pace it behind the
+            # previous one instead of firing every call back-to-back. No
+            # point pacing a call the breaker is about to skip anyway.
+            time.sleep(EVENT_FETCH_PACING_SECONDS)
+
+        row = _create_signal_cache_row(
+            session, market, date, flush=False, existing=cached,
+            skip_event_fetch=breaker_tripped,
+        )
+        result[date] = row
+        fetch_count += 1
+        unflushed_count += 1
+
+        event_source = row.source.partition("+")[0]
+        if not breaker_tripped:
+            # Only a REAL attempt updates the streak - a skipped date is
+            # already-known-bad, not a new data point about OpenWeb Ninja's
+            # current state.
+            consecutive_event_failures = (
+                consecutive_event_failures + 1 if event_source != "openwebninja" else 0
+            )
+
+        if unflushed_count >= SIGNAL_BATCH_FLUSH_EVERY:
+            session.flush()
+            unflushed_count = 0
+    if unflushed_count > 0:
         session.flush()
     return result
 
 
-def _create_signal_cache_row(session, market: Market, date: datetime.date, flush: bool = True, existing: ExternalSignalCache = None):
-    event = fetch_event_signal(market.name, market.center_lat, market.center_lng, date)
+def _create_signal_cache_row(session, market: Market, date: datetime.date, flush: bool = True,
+                              existing: ExternalSignalCache = None, skip_event_fetch: bool = False):
+    if skip_event_fetch:
+        # Circuit breaker is open for this batch (see get_or_fetch_signals_batch) -
+        # OpenWeb Ninja has already failed EVENT_CIRCUIT_BREAKER_THRESHOLD times in a
+        # row, so don't pay another full retry+backoff cost finding that out again for
+        # this date. Tagged "openwebninja_error" (not a new "circuit_open" tag) so
+        # _cache_is_stale still treats this row as needing a real fetch on the NEXT
+        # pricing run rather than getting stuck.
+        event = {"lift_pct": 0.0,
+                 "summary": "Skipped: OpenWeb Ninja failed repeatedly earlier in this run; no lift applied.",
+                 "source": "openwebninja_error"}
+    else:
+        event = fetch_event_signal(market.name, market.center_lat, market.center_lng, date)
     # News is fetched via _cached_news_signal (memoized per market per day), not
     # fetch_news_signal directly - see that helper's docstring for why: news
     # isn't meaningfully different from one pricing date to the next the way a
