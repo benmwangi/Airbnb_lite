@@ -413,11 +413,20 @@ def price_single_listing(listing_id: int, days_ahead: int = 365, start_date: dat
     the whole year for just their own property, not every listing in the
     market. Computes the base price once (not per night) for speed.
 
-    Deliberately left on the original per-date-lookup path (signals=None,
-    previous_price=None, existing_row=None, _skip_lookups=False) since it's
-    only ever pricing a single listing - the batching added to
-    run_pricing_cycle exists specifically to avoid O(listings) repeated
-    work, which doesn't apply to a single-listing call."""
+    Uses the same batched signal-cache path as run_pricing_cycle (one cache
+    query plus one flush for the whole date range, instead of one query and
+    one flush per night) rather than the original per-date
+    get_or_fetch_signals lookups. This is the only caller that can put up to
+    `days_ahead` nights through a single request synchronously - run_pricing_cycle
+    never prices more than 14 nights at a time - so the per-date DB round
+    trips that were fine at 14 nights added real latency (and load on the
+    Postgres connection pool) at 365. Note this does NOT reduce how many
+    dates need a fresh fetch_event_signal call - a real per-night event
+    check is inherent to covering new future dates - it only removes the
+    redundant DB queries/flushes around it. A date range far beyond what's
+    already cached can still hit the event API's rate limit partway through;
+    that shows up as event_source "openwebninja_error" (lift_pct 0.0) on the
+    affected nights rather than a full-request failure."""
     session = get_session()
     listing = session.query(Listing).get(listing_id)
     if not listing:
@@ -426,9 +435,34 @@ def price_single_listing(listing_id: int, days_ahead: int = 365, start_date: dat
 
     base_price = predict_base_price(listing)
     start = start_date or datetime.date.today()
-    for offset in range(days_ahead):
-        date = start + datetime.timedelta(days=offset)
-        price_listing_for_date(session, listing, date, base_price=base_price)
+    dates = [start + datetime.timedelta(days=offset) for offset in range(days_ahead)]
+
+    signals_by_date = get_or_fetch_signals_batch(session, listing.market, dates)
+
+    previous_day = session.query(CalendarDay).filter(
+        CalendarDay.listing_id == listing.id,
+        CalendarDay.date == dates[0] - datetime.timedelta(days=1),
+    ).first()
+    previous_price = previous_day.recommended_price if previous_day else None
+
+    existing_rows = {
+        row.date: row
+        for row in session.query(CalendarDay).filter(
+            CalendarDay.listing_id == listing.id,
+            CalendarDay.date.in_(dates),
+        ).all()
+    }
+
+    for date in dates:
+        row = price_listing_for_date(
+            session, listing, date, base_price=base_price,
+            signals=signals_by_date[date],
+            previous_price=previous_price,
+            existing_row=existing_rows.get(date),
+            _skip_lookups=True,
+        )
+        previous_price = row.recommended_price
+
     session.commit()
     session.close()
     print(f"Priced listing {listing_id} for {days_ahead} nights starting {start}.")

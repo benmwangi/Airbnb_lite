@@ -23,10 +23,18 @@ export default function ManageListingPage() {
 
   async function refresh() {
     const c = await api.calendar(listingId, HOST_CALENDAR_DAYS);
-    if (
-      c.length < HOST_CALENDAR_DAYS &&
-      generatedForListing.current !== listingId
-    ) {
+    // Auto-generate ONLY when this listing has never been priced at all. A
+    // full year of calendar rows naturally shrinks by one every day as
+    // "today" advances - nothing scheduled extends the tail; the nightly
+    // cron only keeps a 14-day window fresh for guest search/booking (see
+    // api/cron/nightly-pricing/route.ts). Triggering on "fewer than a full
+    // year" instead of "empty" meant this fired again on literally every
+    // visit after the first, silently overwriting real, signal-driven
+    // prices with a slower, per-date regen prone to falling back to flat
+    // pricing once the external APIs get rate-limited partway through 365
+    // nights. A host who wants a fresh year can still use the confirm-gated
+    // "Regenerate" button below.
+    if (c.length === 0 && generatedForListing.current !== listingId) {
       generatedForListing.current = listingId;
       setGenerating(true);
       await api.priceYear(listingId, HOST_CALENDAR_DAYS);
