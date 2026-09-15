@@ -15,6 +15,20 @@ Real integrations:
     key itself is account-wide - visit the API's page and subscribe (a free
     tier covers this) or every call 403s with "You are not subscribed to this
     API" regardless of how valid the key is.
+    ON THE PRO PLAN (10,000 requests/month): that monthly ceiling is generous,
+    but it does NOT by itself prevent 429s - Pro-plan production incidents on
+    2026-09-14/15 showed a 429 (burst/per-minute rate limit) followed by
+    back-to-back read timeouts, all while nowhere near 10,000 calls for the
+    month. A host's full-year price view fires up to 365 fetch_event_signal
+    calls in one request with no pacing between them, which is enough to trip
+    a short-window rate limit even on a plan with plenty of monthly headroom
+    left. See _request_with_retry below and pricing_engine.py's
+    EVENT_FETCH_PACING_SECONDS for the two-part fix: pace the calls so a big
+    batch doesn't burst in the first place, and retry-with-backoff so a 429 or
+    timeout that slips through anyway is recovered instead of permanently
+    cached as an error (see pricing_engine.py's _cache_is_stale - an
+    "..._error" row is always retried on the next pricing run, so the failure
+    you actually need to fix is the live one, not a stuck cache).
     VERIFIED LIVE (2026-09-14, one real call against "Events in Paris"): the
     response envelope is a top-level `data` list, as assumed. However, every
     sampled event's `venue.latitude`/`venue.longitude` came back null - this
@@ -39,6 +53,8 @@ end to end. The `source` field on every result tells you which path was used -
 check that field before trusting a number in a real deployment.
 """
 import os
+import time
+import random
 import hashlib
 import datetime
 import requests
@@ -56,6 +72,61 @@ NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY", "")
 
 OPENWEBNINJA_EVENTS_URL = "https://api.openwebninja.com/realtime-events-data/search-events"
 NEWSAPI_EVERYTHING_URL = "https://newsapi.org/v2/everything"
+
+# Status codes worth retrying: 429 (rate limit) and the usual transient 5xx
+# server errors. Anything else (401/403/404/etc) is a real, non-transient
+# problem - retrying it would just fail identically every time, so those are
+# raised immediately with no retry loop.
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+_MAX_ATTEMPTS = 3  # 1 initial try + 2 retries
+_RETRY_BASE_DELAY_SECONDS = 1.5  # doubles each attempt: ~1.5s, ~3s
+_MAX_RETRY_AFTER_SECONDS = 10  # cap in case a server sends an unreasonable Retry-After
+
+
+def _request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
+    """requests.request() wrapper with retry-with-backoff for transient
+    failures only: a 429/5xx response, or a read/connect timeout. Both showed
+    up in production against OpenWeb Ninja's Pro plan (see module docstring)
+    even though the monthly quota wasn't close to exhausted - a burst of
+    calls (e.g. a 365-night host year view) can still trip a short-window
+    rate limit, and OpenWeb Ninja's servers evidently slow down/time out
+    under that same throttling rather than always returning a clean 429.
+
+    Honors a numeric Retry-After header on a 429/5xx when the server sends
+    one (capped at _MAX_RETRY_AFTER_SECONDS so a misbehaving server can't
+    stall a pricing run indefinitely); otherwise falls back to exponential
+    backoff with a little jitter so concurrent callers don't all retry in
+    lockstep.
+
+    A non-transient HTTP error (401, 403, 404, ...) is NOT retried - raised
+    immediately via raise_for_status() on the first attempt, same as before
+    this wrapper existed, since retrying a "not subscribed to this API" 403
+    three times wastes time and produces the same failure regardless.
+    """
+    last_exception = None
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            resp = requests.request(method, url, **kwargs)
+        except requests.Timeout as e:
+            last_exception = e
+            if attempt == _MAX_ATTEMPTS - 1:
+                raise
+            time.sleep(_RETRY_BASE_DELAY_SECONDS * (2 ** attempt) + random.uniform(0, 0.5))
+            continue
+
+        if resp.status_code in _RETRYABLE_STATUS_CODES and attempt < _MAX_ATTEMPTS - 1:
+            retry_after_header = resp.headers.get("Retry-After")
+            if retry_after_header and retry_after_header.isdigit():
+                delay = min(float(retry_after_header), _MAX_RETRY_AFTER_SECONDS)
+            else:
+                delay = _RETRY_BASE_DELAY_SECONDS * (2 ** attempt)
+            time.sleep(delay + random.uniform(0, 0.5))
+            continue
+
+        resp.raise_for_status()  # non-transient error -> raised immediately; success -> no-op
+        return resp
+
+    raise last_exception  # pragma: no cover - loop above always returns or raises first
 
 # Used only by fetch_event_signal's synthetic fallback (no OPENWEBNINJA_API_KEY set)
 # to name what KIND of event triggered a price lift, instead of one generic
@@ -90,15 +161,21 @@ def fetch_event_signal(market_name: str, lat: float, lng: float, date: datetime.
     """
     if OPENWEBNINJA_API_KEY:
         try:
-            resp = requests.get(
+            resp = _request_with_retry(
+                "GET",
                 OPENWEBNINJA_EVENTS_URL,
                 headers={"x-api-key": OPENWEBNINJA_API_KEY},
                 # Location lives in the query text (Google Events-style search), not a
                 # radius param - this is what scopes results to market_name at all.
                 params={"query": f"Events in {market_name}"},
-                timeout=10,
+                # 15s, not 10s: the 2026-09-14/15 Pro-plan read timeouts came in right
+                # after a 429, consistent with OpenWeb Ninja's servers being slow under
+                # the same throttling rather than a hard block - a bit more headroom
+                # here means fewer of those get treated as a hard failure. Retries
+                # (see _request_with_retry) are still the primary defense; this just
+                # makes a single slow-but-real response less likely to be cut off.
+                timeout=15,
             )
-            resp.raise_for_status()
             events = resp.json().get("data", [])  # confirmed live - see module docstring
 
             matching_on_date = []
@@ -172,7 +249,8 @@ def fetch_news_signal(market_name: str, as_of: datetime.date = None) -> dict:
     if NEWSAPI_KEY:
         try:
             window_start = as_of - datetime.timedelta(days=NEWS_LOOKBACK_DAYS)
-            resp = requests.get(
+            resp = _request_with_retry(
+                "GET",
                 NEWSAPI_EVERYTHING_URL,
                 params={
                     "q": f'"{market_name}" AND (tourism OR travel OR visitors)',
@@ -182,9 +260,16 @@ def fetch_news_signal(market_name: str, as_of: datetime.date = None) -> dict:
                     "sortBy": "relevancy",
                     "apiKey": NEWSAPI_KEY,
                 },
-                timeout=10,
+                timeout=15,
             )
-            resp.raise_for_status()
+            # NOTE: retries here only help a TRANSIENT failure (429/5xx/timeout). If
+            # every call is failing, that's more likely NewsAPI's free "Developer"
+            # plan blocking requests from a deployed/production server outright
+            # (documented as dev-only, not licensed for live projects) rather than
+            # something backoff can recover from - check the actual error message
+            # this produces (it's cached verbatim on ExternalSignalCache.news_summary)
+            # and NewsAPI's own dashboard for the key's plan/quota status before
+            # assuming retries alone will fix a persistently-failing news signal.
             total = resp.json().get("totalResults", 0)
             # more travel-relevant coverage recently -> small positive demand signal
             lift = min(0.06, total / 500)

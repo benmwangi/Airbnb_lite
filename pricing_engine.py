@@ -22,6 +22,7 @@ called standalone (as price_single_listing() does) by falling back to its
 original per-call lookups when the batched inputs aren't supplied, so
 behavior for that caller is unchanged.
 """
+import time
 import datetime
 from functools import lru_cache
 import numpy as np
@@ -32,6 +33,18 @@ from external_signals import fetch_event_signal, fetch_news_signal, OPENWEBNINJA
 
 WEIGHTS = {"event": 0.30, "news": 0.15, "seasonality": 0.20}
 MAX_NIGHT_OVER_NIGHT_CHANGE_PCT = 0.15   # guardrail: no more than +/-15% vs previous night's price
+
+# Delay before each REAL (non-cached) OpenWeb Ninja call after the first one in
+# a get_or_fetch_signals_batch run. A host's full-year price view can trigger
+# up to 365 of these in a single request with nothing else pacing them - on
+# 2026-09-14/15 that burst tripped OpenWeb Ninja's rate limit (429, then
+# read timeouts) even on the Pro plan's 10,000-requests/month quota, because a
+# generous monthly ceiling doesn't by itself prevent a per-minute/per-second
+# burst limit from being hit. This keeps a 365-call batch under ~3.3
+# requests/sec, which is the cheap, proactive half of the fix;
+# external_signals.py's _request_with_retry is the reactive half for whatever
+# still slips through despite the pacing.
+EVENT_FETCH_PACING_SECONDS = 0.3
 
 
 def seasonality_modifier(date: datetime.date) -> float:
@@ -91,7 +104,13 @@ def get_or_fetch_signals_batch(session, market: Market, dates: list):
     events genuinely vary night to night) plus a _cached_news_signal call
     (memoized per market per day - see its docstring for why news does NOT
     vary per date the way events do), and those rows are flushed once at the
-    end rather than one flush per row."""
+    end rather than one flush per row.
+
+    A real fetch_event_signal call is paced EVENT_FETCH_PACING_SECONDS apart
+    from the previous one in this same batch (see that constant's comment) -
+    a large batch (e.g. a host's 365-night year view) would otherwise fire
+    every OpenWeb Ninja call back-to-back with nothing throttling it, which is
+    what tripped a 429 in production even on a generous monthly quota."""
     existing = {
         row.date: row
         for row in session.query(ExternalSignalCache).filter(
@@ -106,6 +125,10 @@ def get_or_fetch_signals_batch(session, market: Market, dates: list):
         if cached is not None and not _cache_is_stale(cached):
             result[date] = cached
         else:
+            if created_any:
+                # Not the first real fetch in this batch - pace it behind the
+                # previous one instead of firing every call back-to-back.
+                time.sleep(EVENT_FETCH_PACING_SECONDS)
             result[date] = _create_signal_cache_row(session, market, date, flush=False, existing=cached)
             created_any = True
     if created_any:
