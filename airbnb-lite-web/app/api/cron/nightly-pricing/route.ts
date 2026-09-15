@@ -11,6 +11,13 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 // price-year view does. run_pricing_cycle upserts by (listing_id, date), so
 // this route is safe to fire more than once if Vercel's best-effort cron
 // delivery ever double-invokes it.
+//
+// The backend's /pricing/run now also requires CRON_SECRET (previously it
+// was open to anyone who found the URL), so this route forwards the same
+// secret it just used to authenticate the inbound request - same pattern as
+// monthly-maintenance/route.ts. Without this forward, this route's own
+// auth check would still pass, but the backend call would 401 and nightly
+// pricing would silently stop running.
 export async function GET(request: NextRequest) {
   const authHeader = request.headers.get("authorization");
   const cronSecret = process.env.CRON_SECRET;
@@ -18,7 +25,10 @@ export async function GET(request: NextRequest) {
     return new NextResponse("Unauthorized", { status: 401 });
   }
 
-  const res = await fetch(`${API_URL}/pricing/run?days_ahead=14`, { method: "POST" });
+  const res = await fetch(`${API_URL}/pricing/run?days_ahead=14`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${cronSecret}` },
+  });
   if (!res.ok) {
     return NextResponse.json({ error: `pricing run failed: ${res.status}` }, { status: 502 });
   }

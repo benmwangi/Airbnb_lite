@@ -11,6 +11,7 @@ manager or partner API needed. See README.md for what changes if you ever
 point this at a real, live Airbnb listing instead.
 """
 import datetime
+import hmac
 import os
 import time
 from typing import Optional
@@ -31,6 +32,21 @@ _markets_cache: tuple[float, list[dict]] | None = None
 # claude/deployment-scheduling-guide.md) - unset locally, where this endpoint
 # simply isn't callable rather than silently open.
 CRON_SECRET = os.environ.get("CRON_SECRET")
+
+
+def _require_cron_secret(authorization: Optional[str]):
+    """Shared guard for the two cron-only endpoints. Uses hmac.compare_digest
+    rather than `!=` so a timing attack can't be used to guess CRON_SECRET one
+    byte at a time - a plain string comparison short-circuits on the first
+    mismatched byte, which leaks how many leading characters were correct via
+    response timing. Requires CRON_SECRET to be set at all: if it's unset
+    (e.g. a misconfigured deploy), this endpoint must stay closed rather than
+    accept any/no Authorization header."""
+    if not CRON_SECRET:
+        raise HTTPException(401, "Not authorized")
+    expected = f"Bearer {CRON_SECRET}"
+    if not authorization or not hmac.compare_digest(authorization, expected):
+        raise HTTPException(401, "Not authorized")
 
 
 def _unique_image_listing_ids(session, market_id: Optional[int] = None):
@@ -387,7 +403,19 @@ def listing_calendar(listing_id: int, days: int = MAX_HOST_CALENDAR_DAYS):
 
 
 @app.post("/pricing/run")
-def trigger_pricing_run(days_ahead: int = 365):
+def trigger_pricing_run(days_ahead: int = 14, authorization: Optional[str] = Header(None)):
+    """Runs a pricing cycle across every listing/market. Guarded by
+    CRON_SECRET like /admin/retrain-and-fix-guardrails below - this was
+    previously left open, callable by anyone who found the URL, and with no
+    bound on days_ahead a single unauthenticated request could force a full
+    365-day repricing across every listing. Default dropped from 365 to 14 to
+    match what the nightly cron actually asks for (see
+    nightly-pricing/route.ts); the host year-view has its own dedicated,
+    ownership-checked endpoint (/listings/{id}/price-year) for the 365-day
+    case."""
+    _require_cron_secret(authorization)
+    if not 1 <= days_ahead <= MAX_HOST_CALENDAR_DAYS:
+        raise HTTPException(400, f"days_ahead must be between 1 and {MAX_HOST_CALENDAR_DAYS}")
     run_pricing_cycle(days_ahead=days_ahead)
     return {"status": "ok", "days_ahead": days_ahead}
 
@@ -406,11 +434,11 @@ def retrain_and_fix_guardrails(authorization: Optional[str] = Header(None)):
     would just recompute identical guardrails for no benefit. Meant to be
     triggered monthly (or on demand) - see claude/deployment-scheduling-guide.md.
 
-    Guarded by CRON_SECRET rather than left open like /pricing/run, since
-    retraining is materially more expensive (refits a RandomForest per
-    market) and rewrites model files on disk."""
-    if not CRON_SECRET or authorization != f"Bearer {CRON_SECRET}":
-        raise HTTPException(401, "Not authorized")
+    Guarded by CRON_SECRET, same as /pricing/run - retraining is materially
+    more expensive than a normal pricing run (refits a RandomForest per
+    market) and rewrites model files on disk, so it's worth keeping this
+    behind the same check even though both endpoints are now locked down."""
+    _require_cron_secret(authorization)
 
     train_all_markets()
     # load_market_model() is cached per worker process (see pricing_model.py's
