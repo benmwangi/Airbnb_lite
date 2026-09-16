@@ -23,5 +23,15 @@ pandas
 # both the train/test split and the forest) given the same DB contents, so
 # this is a safe, reproducible retrain rather than a fresh/different model.
 scikit-learn==1.9.0
+# train_all_markets() now fits an XGBoost candidate alongside RandomForest per
+# market and keeps whichever wins on test R2 (see pricing_model.py) - so a
+# market_*.joblib file can now be an XGBRegressor, not just a RandomForest.
+# Pinned for the same reason as scikit-learn above: joblib-pickled model
+# compatibility, not just API compatibility, across versions isn't guaranteed.
+# Deliberately NOT the latest release (3.x) - that pulls in nvidia-nccl-cu12 (a
+# large CUDA library, irrelevant on Render's CPU-only free tier) as a transitive
+# dependency, which slows the build and adds nothing; 2.1.4 has no such
+# dependency and is what crisp-dm/05_full_archive_model_selection.ipynb used.
+xgboost==2.1.4
 requests
 streamlit

@@ -440,7 +440,11 @@ def retrain_and_fix_guardrails(authorization: Optional[str] = Header(None)):
     behind the same check even though both endpoints are now locked down."""
     _require_cron_secret(authorization)
 
-    train_all_markets()
+    # Returns {market_name: {"algorithm": "RandomForest"|"XGBoost", "r2": ..., "mae": ...,
+    # "r2_by_algorithm": {...}, ...}} - train_all_markets() now fits both candidates per
+    # market and keeps whichever wins on test-set R2 (see pricing_model.py), so this
+    # response is how to see which one won without digging through Render's logs.
+    training_results = train_all_markets()
     # load_market_model() is cached per worker process (see pricing_model.py's
     # @lru_cache) - without clearing it here, predict_base_price below would
     # keep returning predictions from the model loaded before this retrain,
@@ -460,7 +464,7 @@ def retrain_and_fix_guardrails(authorization: Optional[str] = Header(None)):
     session.close()
 
     run_pricing_cycle(days_ahead=14)
-    return {"status": "ok", "listings_fixed": fixed}
+    return {"status": "ok", "listings_fixed": fixed, "training_results": training_results}
 
 
 class ApprovalRequest(BaseModel):

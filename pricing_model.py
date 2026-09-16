@@ -1,9 +1,11 @@
 """
 Per-market structural base price model.
 
-One model is trained PER MARKET. Each model only ever sees listings from
-its own currency and local price distribution, so predictions are directly
-usable as that market's price basis - no cross-market leakage possible.
+One model is trained PER MARKET, and PER MARKET the best-performing algorithm
+is picked automatically by test-set R2 - see train_all_markets() below. Each
+model only ever sees listings from its own currency and local price
+distribution, so predictions are directly usable as that market's price basis
+- no cross-market leakage possible.
 
 Feature columns are computed PER MARKET and saved alongside each model, because
 real-world room_type categories differ by city (e.g. "Hotel room" appears in
@@ -17,6 +19,7 @@ import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score
+from xgboost import XGBRegressor
 
 from db import get_session, Listing, Market
 
@@ -78,18 +81,47 @@ def train_all_markets():
         y_log = np.log1p(df["price"])
         X_train, X_test, y_train_log, y_test_log = train_test_split(X, y_log, test_size=0.2, random_state=42)
 
-        model = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42, n_jobs=-1)
-        model.fit(X_train, y_train_log)
-
-        preds = np.expm1(model.predict(X_test))
+        # Two candidates, trained on the SAME train/test split so their R2s are
+        # directly comparable - not two separate random splits that could favor
+        # one by luck. Only these two: crisp-dm/05_full_archive_model_selection.ipynb
+        # showed Linear/Ridge regression dominated by 15-30+ R2 points in every one
+        # of the 10 markets on the full Inside Airbnb archive, so they aren't worth
+        # the extra training time in a path that runs synchronously inside an HTTP
+        # request (/admin/retrain-and-fix-guardrails). That notebook also found
+        # XGBoost won on R2 in 9/10 markets there and Random Forest won the 10th
+        # (Mexico City) - but it trained on a much larger, different sample (the
+        # full archive) than this function's live `Listing` table, so the winner
+        # is decided fresh here, per retrain, against whatever's actually in the
+        # DB right now, rather than hardcoding that notebook's specific mapping.
+        candidates = {
+            "RandomForest": RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42, n_jobs=-1),
+            "XGBoost": XGBRegressor(n_estimators=200, max_depth=5, learning_rate=0.08, random_state=42,
+                                     n_jobs=-1, verbosity=0),
+        }
         y_test = np.expm1(y_test_log)
-        mae = mean_absolute_error(y_test, preds)
-        r2 = r2_score(y_test, preds)
+        scored = {}
+        for name, candidate in candidates.items():
+            candidate.fit(X_train, y_train_log)
+            preds = np.expm1(candidate.predict(X_test))
+            scored[name] = {
+                "model": candidate,
+                "mae": mean_absolute_error(y_test, preds),
+                "r2": r2_score(y_test, preds),
+            }
 
-        joblib.dump({"model": model, "columns": feature_columns},
+        best_name = max(scored, key=lambda name: scored[name]["r2"])
+        model, mae, r2 = scored[best_name]["model"], scored[best_name]["mae"], scored[best_name]["r2"]
+
+        joblib.dump({"model": model, "columns": feature_columns, "algorithm": best_name},
                     os.path.join(MODEL_DIR, f"market_{market.id}.joblib"))
-        results[market.name] = {"mae": round(mae, 2), "r2": round(r2, 3), "n": len(df), "currency": market.currency}
-        print(f"{market.name:15s} ({market.currency}): MAE={mae:9.2f}  R2={r2:.3f}  n={len(df)}")
+        results[market.name] = {
+            "algorithm": best_name, "mae": round(mae, 2), "r2": round(r2, 3), "n": len(df),
+            "currency": market.currency,
+            "r2_by_algorithm": {name: round(s["r2"], 3) for name, s in scored.items()},
+        }
+        comparison = "  ".join(f"{name}={s['r2']:.3f}" for name, s in scored.items())
+        print(f"{market.name:15s} ({market.currency}): winner={best_name:12s} MAE={mae:9.2f}  R2={r2:.3f}  "
+              f"[{comparison}]  n={len(df)}")
 
     session.close()
     return results
