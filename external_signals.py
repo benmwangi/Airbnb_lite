@@ -128,6 +128,32 @@ def _request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
 
     raise last_exception  # pragma: no cover - loop above always returns or raises first
 
+
+def _safe_error_summary(source_name: str, e: requests.RequestException) -> str:
+    """Builds the string that gets cached verbatim on
+    ExternalSignalCache.event_summary/news_summary - which must NEVER include
+    str(e) directly. requests' HTTPError message includes the full request
+    URL, and for NewsAPI that URL's query string carries `apiKey=<the real
+    key>` (OpenWeb Ninja's key travels as an `x-api-key` header instead, so
+    it isn't in the URL, but there's no reason to rely on that difference
+    call-site by call-site). A 2026-09-16 incident showed exactly this: an
+    apiKeyInvalid 401 got stored with its full request URL, key included, in
+    a production Postgres table anyone with SQL access (or a screenshot)
+    could read.
+
+    Uses the HTTP status code from e.response when there is one (any
+    requests.HTTPError raised by _request_with_retry's raise_for_status()
+    call) - enough to tell an auth failure (401/403) from a rate limit (429)
+    from a server error (5xx) without ever touching e.response.url or
+    e.request.url. Falls back to the exception's class name (e.g.
+    "ConnectTimeout", "ReadTimeout") for a requests.Timeout, which has no
+    .response at all.
+    """
+    if e.response is not None:
+        return f"{source_name} fetch failed (HTTP {e.response.status_code}); no lift applied."
+    return f"{source_name} fetch failed ({type(e).__name__}); no lift applied."
+
+
 # Used only by fetch_event_signal's synthetic fallback (no OPENWEBNINJA_API_KEY set)
 # to name what KIND of event triggered a price lift, instead of one generic
 # "high-impact event" phrase for every synthetic hit. See the fallback's own
@@ -199,7 +225,7 @@ def fetch_event_signal(market_name: str, lat: float, lng: float, date: datetime.
             names = ", ".join(e.get("name", "event") for e in matching_on_date[:3])
             return {"lift_pct": round(lift, 3), "summary": f"Nearby: {names}", "source": "openwebninja"}
         except requests.RequestException as e:
-            return {"lift_pct": 0.0, "summary": f"OpenWeb Ninja fetch failed ({e}); no lift applied.",
+            return {"lift_pct": 0.0, "summary": _safe_error_summary("OpenWeb Ninja", e),
                     "source": "openwebninja_error"}
 
     # Synthetic fallback: deterministic per market/date, occasional larger "event weekend" spikes.
@@ -277,7 +303,7 @@ def fetch_news_signal(market_name: str, as_of: datetime.date = None) -> dict:
                     "summary": f"{total} relevant articles in the last {NEWS_LOOKBACK_DAYS} days.",
                     "source": "newsapi"}
         except requests.RequestException as e:
-            return {"lift_pct": 0.0, "summary": f"NewsAPI fetch failed ({e}); no lift applied.",
+            return {"lift_pct": 0.0, "summary": _safe_error_summary("NewsAPI", e),
                     "source": "newsapi_error"}
 
     u = _deterministic_unit("news", market_name, as_of.isoformat())
