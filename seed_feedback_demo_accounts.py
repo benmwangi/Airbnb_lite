@@ -19,10 +19,20 @@ look like the feature simply hadn't run for that account):
 Both host_ids are real, existing hosts in the dataset - not fabricated - so
 their "My Listings" pages show genuine portfolio data, not empty shells.
 
+Both accounts are marked is_demo=True (see db.py's User model): these
+credentials are published in this file, so main.py restricts what a demo
+login can mutate - see seed_demo_accounts.py's docstring for the specifics
+(/pricing/approve refuses demo sessions outright, /listings/{id}/price-year
+caps their days_ahead). Without that flag these two accounts would have full
+write access to two more real hosts' live pricing, exactly like the primary
+demo host does.
+
 Run review_insights_loader.py against fixture_two_hosts.csv BEFORE this
 script if you want the recommendations to be visible immediately after
 logging in; otherwise both accounts will show "no recommendations yet" until
-you do. Safe to re-run - skips accounts that already exist.
+you do. Safe to re-run - skips accounts that already exist, but still sets
+is_demo=True on an existing row so this can retroactively fix a database
+seeded before that column existed.
 
 Usage:
     python seed_feedback_demo_accounts.py
@@ -49,13 +59,15 @@ def seed():
     session = get_session()
 
     for acct in ACCOUNTS:
-        if session.query(User).filter_by(email=acct["email"]).first():
-            print(f"{acct['email']} already exists - skipped")
+        existing = session.query(User).filter_by(email=acct["email"]).first()
+        if existing:
+            existing.is_demo = True
+            print(f"{acct['email']} already exists - marked is_demo")
             continue
         h, salt = auth.hash_password("demo12345")
         session.add(User(
             email=acct["email"], password_hash=h, password_salt=salt,
-            name=acct["name"], role="host", host_id=acct["host_id"],
+            name=acct["name"], role="host", host_id=acct["host_id"], is_demo=True,
         ))
         print(f"Created {acct['email']} (password: demo12345, host_id={acct['host_id']})")
 

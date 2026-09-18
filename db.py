@@ -175,7 +175,7 @@ class ExternalSignalCache(Base):
     news_lift_pct = Column(Float, default=0.0)
     news_summary = Column(Text)
     fetched_at = Column(DateTime, default=datetime.datetime.utcnow)
-    source = Column(String, default="synthetic")  # "openwebninja", "newsapi", or "synthetic"
+    source = Column(String, default="synthetic")  # "predicthq", "newsapi", or "synthetic"
 
 
 class MarketComparison(Base):
@@ -240,7 +240,18 @@ class User(Base):
     to the numeric host_id already used on Listing rows (real Maven/Inside
     Airbnb host IDs), so logging in as a host scopes /host/my-listings to
     the listings that host actually owns instead of a hardcoded default.
-    Guest accounts leave host_id null."""
+    Guest accounts leave host_id null.
+
+    is_demo marks the publicly-documented shared demo logins (see
+    seed_demo_accounts.py / seed_feedback_demo_accounts.py). Their
+    credentials are published in plain text in the repo specifically so
+    anyone can try the app without signing up - which also means anyone can
+    log in as them, including as the real archive-backed hosts some of them
+    are linked to. main.py uses this flag to restrict what a demo session
+    can mutate (see /pricing/approve and /listings/{id}/price-year) rather
+    than trusting a demo login with the same write access as a real host's
+    own account.
+    """
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True)
@@ -250,6 +261,7 @@ class User(Base):
     name = Column(String, nullable=False)
     role = Column(String, nullable=False)  # "guest" or "host"
     host_id = Column(Integer, nullable=True)
+    is_demo = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
@@ -271,6 +283,14 @@ def init_db():
     _sync_postgres_sequences()
     _ensure_column("calendar_days", "guest_user_id", "INTEGER")
     _ensure_column("markets", "listing_count", "INTEGER NOT NULL DEFAULT 0")
+    # Added when demo-account write access was locked down (see main.py's
+    # /pricing/approve and /listings/{id}/price-year) - a database created
+    # before this column existed needs it added directly, same reasoning as
+    # every other _ensure_column call here. Defaults to FALSE so every
+    # pre-existing row (including the seeded demo accounts, until their seed
+    # script is re-run) is treated as a normal, non-demo account until
+    # explicitly marked otherwise.
+    _ensure_column("users", "is_demo", "BOOLEAN NOT NULL DEFAULT FALSE")
     for column, sql_type in {
         "host_name": "TEXT", "name": "TEXT", "description": "TEXT", "host_since": "DATE",
         "host_location": "TEXT", "neighbourhood": "TEXT", "property_type": "TEXT",

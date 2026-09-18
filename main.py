@@ -27,6 +27,17 @@ from pricing_model import train_all_markets, predict_base_price, load_market_mod
 
 app = FastAPI(title="Airbnb-lite Dynamic Pricing API")
 MAX_HOST_CALENDAR_DAYS = 365
+# A demo login's /listings/{id}/price-year calls are capped to this many
+# days, matching the nightly cron's pre-warmed signal window (14 days - see
+# claude/deployment-scheduling-guide.md and pricing_engine.py's
+# run_pricing_cycle). Demo credentials (seed_demo_accounts.py /
+# seed_feedback_demo_accounts.py) are published in the repo so anyone can
+# log in as them, and they sit on real archive-backed listings - capping to
+# the already-cached window means a demo login's price-year call can never
+# touch a market/date the nightly job hasn't already fetched, so it can't
+# trigger the kind of external-API burst described in external_signals.py's
+# module docstring.
+DEMO_PRICE_YEAR_MAX_DAYS = 14
 _markets_cache: tuple[float, list[dict]] | None = None
 # Shared secret the scheduled maintenance cron authenticates with (see
 # claude/deployment-scheduling-guide.md) - unset locally, where this endpoint
@@ -116,7 +127,8 @@ class LoginRequest(BaseModel):
 
 
 def _user_out(user: User) -> dict:
-    return {"id": user.id, "email": user.email, "name": user.name, "role": user.role, "host_id": user.host_id}
+    return {"id": user.id, "email": user.email, "name": user.name, "role": user.role,
+            "host_id": user.host_id, "is_demo": user.is_demo}
 
 
 @app.post("/auth/signup")
@@ -222,11 +234,16 @@ def my_listings(authorization: Optional[str] = Header(None)):
     return out
 
 
-def _require_listing_owner(session, listing_id: int, authorization: Optional[str]) -> Listing:
+def _require_listing_owner(session, listing_id: int, authorization: Optional[str]):
     """Confirms the request carries a valid host session AND that host
     actually owns this listing, before allowing a pricing mutation. Without
     this, any client could set or approve prices on a listing that isn't
-    theirs just by knowing its numeric id."""
+    theirs just by knowing its numeric id.
+
+    Returns (listing, user) - callers that need to further restrict what a
+    demo login (user.is_demo) can do use the returned user instead of
+    re-authenticating themselves. See /pricing/approve and
+    /listings/{id}/price-year for how each uses it."""
     user = auth.get_user_from_token(auth.extract_bearer_token(authorization))
     if not user or user.role != "host":
         raise HTTPException(401, "Host login required")
@@ -235,7 +252,7 @@ def _require_listing_owner(session, listing_id: int, authorization: Optional[str
         raise HTTPException(404, "Listing not found")
     if listing.host_id != user.host_id:
         raise HTTPException(403, "You don't own this listing")
-    return listing
+    return listing, user
 
 
 @app.post("/listings/{listing_id}/price-year")
@@ -243,17 +260,31 @@ def price_year(listing_id: int, days_ahead: int = MAX_HOST_CALENDAR_DAYS, author
     """Prices a single listing across a long horizon (a full year by default) -
     used by the host year-calendar view. Runs synchronously; ~3s for 365
     nights for one listing (verified), since base-price inference happens once
-    per call rather than once per night."""
+    per call rather than once per night.
+
+    A demo login (user.is_demo - see seed_demo_accounts.py) has its
+    days_ahead silently capped to DEMO_PRICE_YEAR_MAX_DAYS. These are shared,
+    publicly-documented credentials sitting on real archive-backed listings,
+    and an uncapped call here can fire hundreds of live external event/news
+    API calls (see external_signals.py's module docstring, which documents a
+    real production incident caused by exactly this call pattern) for date
+    ranges the nightly cron hasn't warmed yet. The response's days_ahead and
+    demo_capped fields reflect what was actually applied, so a capped call
+    is visible to the caller rather than silently different from what was
+    requested."""
     if not 1 <= days_ahead <= MAX_HOST_CALENDAR_DAYS:
         raise HTTPException(400, f"days_ahead must be between 1 and {MAX_HOST_CALENDAR_DAYS}")
     session = get_session()
-    _require_listing_owner(session, listing_id, authorization)
+    listing, user = _require_listing_owner(session, listing_id, authorization)
     session.close()
+    demo_capped = user.is_demo and days_ahead > DEMO_PRICE_YEAR_MAX_DAYS
+    if user.is_demo:
+        days_ahead = min(days_ahead, DEMO_PRICE_YEAR_MAX_DAYS)
     try:
         price_single_listing(listing_id, days_ahead=days_ahead)
     except ValueError:
         raise HTTPException(404, "Listing not found")
-    return {"status": "ok", "listing_id": listing_id, "days_ahead": days_ahead}
+    return {"status": "ok", "listing_id": listing_id, "days_ahead": days_ahead, "demo_capped": demo_capped}
 
 
 @app.get("/listings/card-prices")
@@ -591,9 +622,19 @@ def approve_price(req: ApprovalRequest, authorization: Optional[str] = Header(No
     """Host control layer: approve, reject, or override a single night's recommended
     price. Requires a host session that actually owns this listing - now that
     guest bookings resolve their own price independently (see /bookings), this
-    endpoint is exclusively a host action and is locked down accordingly."""
+    endpoint is exclusively a host action and is locked down accordingly.
+
+    Demo logins (user.is_demo - see seed_demo_accounts.py) are blocked here
+    entirely, rather than capped like /listings/{id}/price-year above: this
+    endpoint WRITES the guest-facing live price for a real archive-backed
+    listing, and demo credentials are published in the repo so anyone can
+    log in as them. A cap doesn't fix that kind of exposure - only refusing
+    the mutation does."""
     session = get_session()
-    _require_listing_owner(session, req.listing_id, authorization)
+    listing, user = _require_listing_owner(session, req.listing_id, authorization)
+    if user.is_demo:
+        session.close()
+        raise HTTPException(403, "Demo accounts are read-only - pricing approvals are disabled for demo logins.")
 
     row = session.query(CalendarDay).filter_by(listing_id=req.listing_id, date=req.date).first()
     if not row:
@@ -624,25 +665,39 @@ def create_booking(req: BookingRequest, authorization: Optional[str] = Header(No
     """Books a night at its resolved guest-facing price: the host's approved
     or set price if one exists, otherwise the host's own floor price - same
     approved/set/floor rule the rest of the guest UI uses (never an
-    unconfirmed recommendation). This does NOT require the night to already
-    be host-approved: a booking is a guest action, not a host pricing
-    decision, so it must not silently mutate live_price/status as a side
-    effect of someone booking. Booking without being logged in is still
-    allowed (keeps the demo frictionless), but if a valid guest session is
-    provided, the booking is tied to that guest so it shows up in their trips."""
+    unconfirmed recommendation).
+
+    Requires a logged-in guest session. This previously allowed anonymous
+    booking ("keeps the demo frictionless" per the original design), but
+    that meant anyone with no account at all could POST any listing_id/date
+    pair and mark it booked - listing IDs are sequential and enumerable via
+    /listings, so this was scriptable into marking every night of every
+    listing "booked" site-wide with zero credentials, a real denial-of-
+    availability risk against the core product. Guest login is required now
+    so a booking is at minimum tied to an accountable identity, and a night
+    that's already booked can no longer be silently overwritten by a second
+    request (see the is_booked check below) - previously a second POST for
+    the same listing/date would quietly steal or corrupt an existing
+    booking's guest_user_id and booked_price."""
     user = auth.get_user_from_token(auth.extract_bearer_token(authorization))
+    if not user or user.role != "guest":
+        raise HTTPException(401, "Guest login required to book")
+    if req.date < datetime.date.today():
+        raise HTTPException(400, "Cannot book a date in the past")
 
     session = get_session()
     row = session.query(CalendarDay).filter_by(listing_id=req.listing_id, date=req.date).first()
     if not row:
         session.close()
         raise HTTPException(404, "No pricing found for this listing/date - has it been priced yet?")
+    if row.is_booked:
+        session.close()
+        raise HTTPException(409, "This night is already booked")
 
     resolved_price = row.live_price if row.live_price is not None else row.listing.min_floor
     row.is_booked = True
     row.booked_price = resolved_price
-    if user and user.role == "guest":
-        row.guest_user_id = user.id
+    row.guest_user_id = user.id
     session.commit()
     result = {"listing_id": req.listing_id, "date": req.date.isoformat(), "booked_price": row.booked_price}
     session.close()

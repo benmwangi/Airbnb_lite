@@ -5,7 +5,16 @@ signing up first:
     archive-backed host with listings that have real review insights.
   - guest@airbnblite.demo / demo12345 - a plain guest account.
 
-Safe to re-run - skips accounts that already exist rather than erroring.
+Both accounts are marked is_demo=True (see db.py's User model) - these
+credentials are published in this file, so main.py restricts what a demo
+login can mutate: /pricing/approve refuses demo sessions outright (they'd
+otherwise be able to override live prices on a real archive-backed host's
+listings), and /listings/{id}/price-year caps a demo session's days_ahead
+so it can't trigger a large burst of external event/news API calls.
+
+Safe to re-run - skips accounts that already exist rather than erroring,
+but still sets is_demo=True on an existing row so this can retroactively
+fix a database seeded before that column existed.
 
 Usage:
     python seed_demo_accounts.py
@@ -24,20 +33,23 @@ def seed():
     if existing_host:
         existing_host.name = "Jayson"
         existing_host.host_id = DEMO_HOST_ID
+        existing_host.is_demo = True
         print("Updated host@airbnblite.demo to an archive-backed host")
     else:
         h, salt = auth.hash_password("demo12345")
         session.add(User(email="host@airbnblite.demo", password_hash=h, password_salt=salt,
-                          name="Jayson", role="host", host_id=DEMO_HOST_ID))
+                          name="Jayson", role="host", host_id=DEMO_HOST_ID, is_demo=True))
         print("Created host@airbnblite.demo (password: demo12345)")
 
-    if not session.query(User).filter_by(email="guest@airbnblite.demo").first():
+    existing_guest = session.query(User).filter_by(email="guest@airbnblite.demo").first()
+    if existing_guest:
+        existing_guest.is_demo = True
+        print("guest@airbnblite.demo already exists - marked is_demo")
+    else:
         h, salt = auth.hash_password("demo12345")
         session.add(User(email="guest@airbnblite.demo", password_hash=h, password_salt=salt,
-                          name="Jordan", role="guest", host_id=None))
+                          name="Jordan", role="guest", host_id=None, is_demo=True))
         print("Created guest@airbnblite.demo (password: demo12345)")
-    else:
-        print("guest@airbnblite.demo already exists - skipped")
 
     session.commit()
     session.close()
